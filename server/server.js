@@ -280,24 +280,31 @@ app.get("/leaderboard", async (req, res) => {
   res.json({ records: result.rows });
 });
 
-app.get("/users/:userId/rank", async (req, res) => {
-  const best = await pool.query(
-    `
-    SELECT total_score, survival_time
-    FROM scores
-    WHERE user_id = $1
-    ORDER BY total_score DESC, survival_time DESC, created_at ASC
-    LIMIT 1
-    `,
-    [req.params.userId],
-  );
+app.get("/scores/me/best", async (req, res) => {
+  const token = bearerToken(req);
+  const payload = token ? verifyAuthToken(token) : null;
+  if (!payload) {
+    return res.status(401).json({ error: "invalid_token" });
+  }
 
-  if (best.rowCount === 0) {
+  const best = await getUserBestScore(payload.sub);
+  if (!best) {
+    return res.json({ record: null, rank: null });
+  }
+
+  res.json({
+    record: best,
+    rank: await getRank(best.total_score, best.survival_time),
+  });
+});
+
+app.get("/users/:userId/rank", async (req, res) => {
+  const best = await getUserBestScore(req.params.userId);
+  if (!best) {
     return res.json({ rank: null });
   }
 
-  const row = best.rows[0];
-  res.json({ rank: await getRank(row.total_score, row.survival_time) });
+  res.json({ rank: await getRank(best.total_score, best.survival_time) });
 });
 
 app.use((error, _req, res, _next) => {
@@ -320,6 +327,20 @@ async function getRank(totalScore, survivalTime) {
     [totalScore, survivalTime],
   );
   return result.rows[0].rank;
+}
+
+async function getUserBestScore(userId) {
+  const result = await pool.query(
+    `
+    SELECT nickname, total_score, survival_time, p_score, created_at
+    FROM scores
+    WHERE user_id = $1
+    ORDER BY total_score DESC, survival_time DESC, created_at ASC
+    LIMIT 1
+    `,
+    [userId],
+  );
+  return result.rowCount === 0 ? null : result.rows[0];
 }
 
 function requireOAuthConfig(provider, keys) {
