@@ -263,9 +263,15 @@ app.get("/leaderboard", async (req, res) => {
   const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 50));
   const result = await pool.query(
     `
+    WITH best_scores AS (
+      SELECT DISTINCT ON (user_id)
+             user_id, nickname, total_score, survival_time, p_score, created_at
+      FROM scores
+      ORDER BY user_id, total_score DESC, survival_time DESC, created_at ASC
+    )
     SELECT nickname, total_score, survival_time, p_score, created_at,
            RANK() OVER (ORDER BY total_score DESC, survival_time DESC) AS rank
-    FROM scores
+    FROM best_scores
     ORDER BY total_score DESC, survival_time DESC, created_at ASC
     LIMIT $1
     `,
@@ -303,7 +309,11 @@ async function getRank(totalScore, survivalTime) {
   const result = await pool.query(
     `
     SELECT COUNT(*)::int + 1 AS rank
-    FROM scores
+    FROM (
+      SELECT DISTINCT ON (user_id) user_id, total_score, survival_time
+      FROM scores
+      ORDER BY user_id, total_score DESC, survival_time DESC, created_at ASC
+    ) best_scores
     WHERE total_score > $1
        OR (total_score = $1 AND survival_time > $2)
     `,
