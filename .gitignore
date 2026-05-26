@@ -1,0 +1,11 @@
+pgdata/
+server/node_modules/
+server/.env
+build/
+.godot/
+.godot_cache_backup/
+android/build/.gradle/
+android/build/build/
+*.apk
+*.aab
+*.idsig
