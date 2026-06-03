@@ -2,11 +2,14 @@ import cors from "cors";
 import { createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
 import dotenv from "dotenv";
 import express from "express";
+import http from "node:http";
 import pg from "pg";
+import { Server as SocketIOServer } from "socket.io";
 
 dotenv.config();
 
 const app = express();
+const httpServer = http.createServer(app);
 const databaseUrl = process.env.DATABASE_URL;
 const jwtSecret = process.env.JWT_SECRET;
 
@@ -24,6 +27,11 @@ const oauthStates = new Map();
 
 app.use(cors());
 app.use(express.json({ limit: "64kb" }));
+
+const io = new SocketIOServer(httpServer, {
+  cors: { origin: "*", methods: ["GET", "POST"] },
+});
+const realtimeRooms = new Map();
 
 // ─── Static Definitions ───────────────────────────────────────────────────────
 
@@ -140,6 +148,93 @@ function cleanNickname(value) {
 function cleanUsername(value) {
   return String(value || "").trim().toLowerCase().replace(/[^a-z0-9_]/g, "").slice(0, 20);
 }
+function cleanModeId(value) {
+  const mode = String(value || "classic").trim().toLowerCase().replace(/[^a-z0-9_]/g, "").slice(0, 32);
+  return mode || "classic";
+}
+function cleanRankingScope(value) {
+  return String(value || "world").trim().toLowerCase() === "friends" ? "friends" : "world";
+}
+function cleanShortText(value, maxLength = 160) {
+  return String(value || "").trim().replace(/\s+/g, " ").slice(0, maxLength);
+}
+function cleanNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+function cleanInt(value, fallback = 0) {
+  const n = Number.parseInt(value, 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+function cleanBool(value) {
+  return value === true || value === "true" || value === 1 || value === "1";
+}
+function cleanTextArray(value, maxItems = 24, maxLength = 40) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, maxItems).map(v => cleanShortText(v, maxLength)).filter(Boolean);
+}
+function normalizeModeData(mode, body = {}) {
+  const raw = body.mode_data && typeof body.mode_data === "object" && !Array.isArray(body.mode_data)
+    ? body.mode_data
+    : {};
+  const common = {
+    death_reason: cleanShortText(raw.death_reason || body.death_reason, 120),
+    mode_score_bonus: Math.max(0, cleanInt(body.mode_score_bonus, 0)),
+  };
+  if (mode === "food_chain") {
+    return {
+      ...common,
+      max_radius: Math.max(0, cleanNumber(raw.max_radius ?? body.mode_metric_primary, 0)),
+      absorbed_bots: Math.max(0, cleanInt(raw.absorbed_bots ?? body.mode_metric_secondary, 0)),
+      p_count: Math.max(0, cleanInt(raw.p_count ?? body.p_count, 0)),
+      coins_earned: Math.max(0, cleanInt(raw.coins_earned, 0)),
+      runner_rewards: Math.max(0, cleanInt(raw.runner_rewards, 0)),
+      golden_orbs: Math.max(0, cleanInt(raw.golden_orbs, 0)),
+    };
+  }
+  if (mode === "bounce") {
+    return {
+      ...common,
+      surge_level: Math.max(0, cleanInt(raw.surge_level ?? body.mode_metric_secondary, 0)),
+      upgrade_count: Math.max(0, cleanInt(raw.upgrade_count ?? body.mode_metric_secondary, 0)),
+      upgrades: cleanTextArray(raw.upgrades, 48, 36),
+      missiles_hit: Math.max(0, cleanInt(raw.missiles_hit, 0)),
+      golden_orbs: Math.max(0, cleanInt(raw.golden_orbs, 0)),
+      diamond_orbs: Math.max(0, cleanInt(raw.diamond_orbs, 0)),
+    };
+  }
+  if (mode === "territory") {
+    return {
+      ...common,
+      zone_time: Math.max(0, cleanNumber(raw.zone_time ?? body.mode_metric_primary, 0)),
+      escape_bonus: Math.max(0, cleanInt(raw.escape_bonus ?? body.mode_metric_secondary, 0)),
+    };
+  }
+  if (mode === "tag") {
+    return {
+      ...common,
+      catches: Math.max(0, cleanInt(raw.catches ?? body.mode_metric_secondary, 0)),
+      survived_as_runner: Math.max(0, cleanNumber(raw.survived_as_runner ?? body.mode_metric_primary, 0)),
+    };
+  }
+  if (mode === "zombie") {
+    return {
+      ...common,
+      infection_time: Math.max(0, cleanNumber(raw.infection_time ?? body.mode_metric_primary, 0)),
+      infected_count: Math.max(0, cleanInt(raw.infected_count ?? body.mode_metric_secondary, 0)),
+    };
+  }
+  return {
+    ...common,
+    p_count: Math.max(0, cleanInt(body.p_count, 0)),
+    s_count: Math.max(0, cleanInt(body.s_count, 0)),
+    shield_blocks: Math.max(0, cleanInt(body.shield_blocks, 0)),
+    shield_activations: Math.max(0, cleanInt(body.shield_activations, 0)),
+    max_combo: Math.max(0, cleanInt(body.max_combo, 0)),
+    used_revival: cleanBool(body.used_revival),
+    was_best: cleanBool(body.was_best),
+  };
+}
 
 function bearerToken(req) {
   const header = String(req.headers.authorization || "");
@@ -179,6 +274,9 @@ async function addCoins(userId, amount, reason, refId = null) {
 
 function todayUtc() {
   return new Date().toISOString().slice(0, 10);
+}
+function makeRoomCode() {
+  return randomBytes(4).toString("hex").toUpperCase().replace(/[^A-F0-9]/g, "").slice(0, 6);
 }
 
 // ─── Health ───────────────────────────────────────────────────────────────────
@@ -338,8 +436,10 @@ app.post("/scores", async (req, res) => {
   const totalScore = Math.max(0, Number.parseInt(req.body.total_score, 10) || 0);
   const survivalTime = Math.max(0, Number(req.body.survival_time) || 0);
   const pScore = Math.max(0, Number.parseInt(req.body.p_score, 10) || 0);
+  const mode = cleanModeId(req.body.mode);
+  const modeScoreBonus = Math.max(0, Number.parseInt(req.body.mode_score_bonus, 10) || 0);
 
-  if (!isPlausibleScore(totalScore, survivalTime, pScore)) {
+  if (!isPlausibleScore(totalScore, survivalTime, pScore, modeScoreBonus)) {
     return res.status(400).json({ error: "implausible_score" });
   }
 
@@ -351,14 +451,32 @@ app.post("/scores", async (req, res) => {
   const maxCombo = Math.max(0, Number.parseInt(req.body.max_combo, 10) || 0);
   const usedRevival = Boolean(req.body.used_revival);
   const wasBest = Boolean(req.body.was_best);
+  const metricPrimary = Math.max(0, Number(req.body.mode_metric_primary) || 0);
+  const metricSecondary = Math.max(0, Number.parseInt(req.body.mode_metric_secondary, 10) || 0);
+  const modeData = normalizeModeData(mode, req.body);
 
   const inserted = await pool.query(
-    `INSERT INTO scores (user_id, nickname, total_score, survival_time, p_score)
-     VALUES ($1, $2, $3, $4, $5)
-     RETURNING id, total_score, survival_time, p_score, created_at`,
-    [user.id, user.nickname, totalScore, survivalTime, pScore],
+    `INSERT INTO scores (user_id, nickname, total_score, survival_time, p_score, mode, mode_data)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     RETURNING id, total_score, survival_time, p_score, mode, mode_data, created_at`,
+    [user.id, user.nickname, totalScore, survivalTime, pScore, mode, modeData],
   );
-  const rank = await getRank(totalScore, survivalTime);
+  const modeScore = await pool.query(
+    `INSERT INTO mode_scores (mode, user_id, nickname, total_score, survival_time, p_score, metric_primary, metric_secondary, mode_data, source_score_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT (source_score_id) DO UPDATE SET
+       mode = EXCLUDED.mode,
+       nickname = EXCLUDED.nickname,
+       total_score = EXCLUDED.total_score,
+       survival_time = EXCLUDED.survival_time,
+       p_score = EXCLUDED.p_score,
+       metric_primary = EXCLUDED.metric_primary,
+       metric_secondary = EXCLUDED.metric_secondary,
+       mode_data = EXCLUDED.mode_data
+     RETURNING id, mode, total_score, survival_time, p_score, metric_primary, metric_secondary, mode_data, created_at`,
+    [mode, user.id, user.nickname, totalScore, survivalTime, pScore, metricPrimary, metricSecondary, modeData, inserted.rows[0].id],
+  );
+  const rank = await getRank(totalScore, survivalTime, mode);
 
   // Update game stats and check achievements
   const { newlyUnlocked, updatedDailyQuests } = await updateGameStats(user.id, {
@@ -368,6 +486,7 @@ app.post("/scores", async (req, res) => {
 
   res.json({
     score: inserted.rows[0],
+    mode_score: modeScore.rows[0],
     rank,
     achievements_unlocked: newlyUnlocked,
     daily_quests_updated: updatedDailyQuests,
@@ -376,35 +495,283 @@ app.post("/scores", async (req, res) => {
 
 app.get("/leaderboard", async (req, res) => {
   const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 50));
+  const mode = cleanModeId(req.query.mode);
+  const scope = cleanRankingScope(req.query.scope);
+  const payload = scope === "friends" ? requireAuth(req, res) : null;
+  if (scope === "friends" && !payload) return;
+  const friendJoin = scope === "friends"
+    ? `WHERE best_scores.user_id = $2
+       OR EXISTS (
+         SELECT 1 FROM friendships f
+         WHERE f.status = 'accepted'
+           AND ((f.user_id = $2 AND f.friend_id = best_scores.user_id)
+             OR (f.friend_id = $2 AND f.user_id = best_scores.user_id))
+       )`
+    : "";
+  const params = scope === "friends" ? [limit, payload.sub, mode] : [limit, mode];
+  const modeParamIndex = scope === "friends" ? 3 : 2;
   const result = await pool.query(
     `WITH best_scores AS (
        SELECT DISTINCT ON (user_id)
-              user_id, nickname, total_score, survival_time, p_score, created_at
-       FROM scores
+              user_id, nickname, total_score, survival_time, p_score, metric_primary, metric_secondary, mode_data, created_at
+       FROM mode_scores
+       WHERE mode = $${modeParamIndex}
        ORDER BY user_id, total_score DESC, survival_time DESC, created_at ASC
      )
-     SELECT nickname, total_score, survival_time, p_score, created_at,
+     SELECT nickname, total_score, survival_time, p_score, metric_primary, metric_secondary, mode_data, created_at,
             RANK() OVER (ORDER BY total_score DESC, survival_time DESC) AS rank
      FROM best_scores
+     ${friendJoin}
      ORDER BY total_score DESC, survival_time DESC, created_at ASC
      LIMIT $1`,
-    [limit],
+    params,
   );
-  res.json({ records: result.rows });
+  res.json({ records: result.rows, mode, scope });
 });
 
 app.get("/scores/me/best", async (req, res) => {
   const payload = requireAuth(req, res);
   if (!payload) return;
-  const best = await getUserBestScore(payload.sub);
+  const mode = cleanModeId(req.query.mode);
+  const best = await getUserBestScore(payload.sub, mode);
   if (!best) return res.json({ record: null, rank: null });
-  res.json({ record: best, rank: await getRank(best.total_score, best.survival_time) });
+  res.json({ record: best, rank: await getRank(best.total_score, best.survival_time, mode) });
 });
 
 app.get("/users/:userId/rank", async (req, res) => {
-  const best = await getUserBestScore(req.params.userId);
+  const mode = cleanModeId(req.query.mode);
+  const best = await getUserBestScore(req.params.userId, mode);
   if (!best) return res.json({ rank: null });
-  res.json({ rank: await getRank(best.total_score, best.survival_time) });
+  res.json({ rank: await getRank(best.total_score, best.survival_time, mode) });
+});
+
+// ─── Friends ──────────────────────────────────────────────────────────────────
+
+app.post("/friends/request/:username", async (req, res) => {
+  const payload = requireAuth(req, res);
+  if (!payload) return;
+  const username = cleanUsername(req.params.username);
+  const friend = await pool.query(
+    "SELECT id, username, nickname FROM users WHERE username = $1 OR nickname = $2",
+    [username, cleanNickname(req.params.username)],
+  );
+  if (friend.rowCount === 0) return res.status(404).json({ error: "user_not_found" });
+  if (friend.rows[0].id === payload.sub) return res.status(400).json({ error: "cannot_add_self" });
+  const reverse = await pool.query(
+    "SELECT status FROM friendships WHERE user_id = $1 AND friend_id = $2",
+    [friend.rows[0].id, payload.sub],
+  );
+  if (reverse.rowCount > 0 && reverse.rows[0].status === "pending") {
+    await pool.query(
+      "UPDATE friendships SET status = 'accepted', updated_at = now() WHERE user_id = $1 AND friend_id = $2",
+      [friend.rows[0].id, payload.sub],
+    );
+    await pool.query(
+      `INSERT INTO friendships (user_id, friend_id, status)
+       VALUES ($1, $2, 'accepted')
+       ON CONFLICT (user_id, friend_id) DO UPDATE SET status = 'accepted', updated_at = now()`,
+      [payload.sub, friend.rows[0].id],
+    );
+    return res.json({ requested: false, accepted: true, friend: friend.rows[0] });
+  }
+  await pool.query(
+    `INSERT INTO friendships (user_id, friend_id, status)
+     VALUES ($1, $2, 'pending')
+     ON CONFLICT (user_id, friend_id) DO UPDATE SET status = friendships.status, updated_at = now()`,
+    [payload.sub, friend.rows[0].id],
+  );
+  res.json({ requested: true, friend: friend.rows[0] });
+});
+
+app.post("/friends/accept/:userId", async (req, res) => {
+  const payload = requireAuth(req, res);
+  if (!payload) return;
+  const requesterId = String(req.params.userId || "");
+  const result = await pool.query(
+    `UPDATE friendships SET status = 'accepted'
+     WHERE user_id = $1 AND friend_id = $2 AND status = 'pending'
+     RETURNING user_id, friend_id, status`,
+    [requesterId, payload.sub],
+  );
+  if (result.rowCount === 0) return res.status(404).json({ error: "request_not_found" });
+  await pool.query(
+    `INSERT INTO friendships (user_id, friend_id, status)
+     VALUES ($1, $2, 'accepted')
+     ON CONFLICT (user_id, friend_id) DO UPDATE SET status = 'accepted'`,
+    [payload.sub, requesterId],
+  );
+  res.json({ accepted: true });
+});
+
+app.delete("/friends/:userId", async (req, res) => {
+  const payload = requireAuth(req, res);
+  if (!payload) return;
+  await pool.query(
+    "DELETE FROM friendships WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $2 AND friend_id = $1)",
+    [payload.sub, String(req.params.userId || "")],
+  );
+  res.json({ deleted: true });
+});
+
+app.get("/friends", async (req, res) => {
+  const payload = requireAuth(req, res);
+  if (!payload) return;
+  const friends = await pool.query(
+    `SELECT u.id, u.username, u.nickname, f.status, f.created_at
+     FROM friendships f
+     JOIN users u ON u.id = f.friend_id
+     WHERE f.user_id = $1 AND f.status = 'accepted'
+     ORDER BY u.nickname ASC, f.created_at DESC`,
+    [payload.sub],
+  );
+  const sent = await pool.query(
+    `SELECT u.id, u.username, u.nickname, f.status, f.created_at
+     FROM friendships f
+     JOIN users u ON u.id = f.friend_id
+     WHERE f.user_id = $1 AND f.status = 'pending'
+     ORDER BY f.created_at DESC`,
+    [payload.sub],
+  );
+  const received = await pool.query(
+    `SELECT u.id, u.username, u.nickname, f.status, f.created_at
+     FROM friendships f
+     JOIN users u ON u.id = f.user_id
+     WHERE f.friend_id = $1 AND f.status = 'pending'
+     ORDER BY f.created_at DESC`,
+    [payload.sub],
+  );
+  res.json({ friends: friends.rows, sent: sent.rows, received: received.rows });
+});
+
+app.get("/friends/ranking", async (req, res) => {
+  const payload = requireAuth(req, res);
+  if (!payload) return;
+  const mode = cleanModeId(req.query.mode);
+  const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 100));
+  const result = await pool.query(
+    `WITH best_scores AS (
+       SELECT DISTINCT ON (s.user_id)
+              s.user_id, s.nickname, s.total_score, s.survival_time, s.p_score, s.metric_primary, s.metric_secondary, s.mode_data, s.created_at
+       FROM mode_scores s
+       WHERE s.mode = $2
+         AND (
+           s.user_id = $1
+           OR EXISTS (
+             SELECT 1 FROM friendships f
+             WHERE f.status = 'accepted'
+               AND ((f.user_id = $1 AND f.friend_id = s.user_id)
+                 OR (f.friend_id = $1 AND f.user_id = s.user_id))
+           )
+         )
+       ORDER BY s.user_id, s.total_score DESC, s.survival_time DESC, s.created_at ASC
+     )
+     SELECT nickname, total_score, survival_time, p_score, metric_primary, metric_secondary, mode_data, created_at,
+            RANK() OVER (ORDER BY total_score DESC, survival_time DESC) AS rank
+     FROM best_scores
+     ORDER BY total_score DESC, survival_time DESC, created_at ASC
+     LIMIT $3`,
+    [payload.sub, mode, limit],
+  );
+  res.json({ records: result.rows, scope: "friends", mode });
+});
+
+// ─── Multiplayer Rooms (REST fallback for Socket.io migration) ────────────────
+
+app.post("/v1/multiplayer/rooms", async (req, res) => {
+  const payload = requireAuth(req, res);
+  if (!payload) return;
+  const mode = cleanModeId(req.body.mode);
+  if (!["tag", "zombie"].includes(mode)) return res.status(400).json({ error: "unsupported_mode" });
+  const maxPlayers = Math.min(6, Math.max(2, Number.parseInt(req.body.max_players, 10) || 6));
+  let room = null;
+  for (let i = 0; i < 5; i++) {
+    const code = makeRoomCode();
+    try {
+      const result = await pool.query(
+        `INSERT INTO game_rooms (room_code, host_id, mode, max_players)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, room_code, host_id, mode, status, max_players, created_at`,
+        [code, payload.sub, mode, maxPlayers],
+      );
+      room = result.rows[0];
+      break;
+    } catch (error) {
+      if (error.code !== "23505") throw error;
+    }
+  }
+  if (!room) return res.status(500).json({ error: "room_code_failed" });
+  await pool.query(
+    `INSERT INTO room_players (room_id, user_id, is_host, is_ready)
+     VALUES ($1, $2, true, true)
+     ON CONFLICT (room_id, user_id) DO UPDATE SET is_host = true, is_ready = true`,
+    [room.id, payload.sub],
+  );
+  res.json({ room });
+});
+
+app.post("/v1/multiplayer/rooms/:roomCode/join", async (req, res) => {
+  const payload = requireAuth(req, res);
+  if (!payload) return;
+  const room = await pool.query(
+    "SELECT * FROM game_rooms WHERE room_code = $1 AND status = 'waiting'",
+    [String(req.params.roomCode || "").toUpperCase()],
+  );
+  if (room.rowCount === 0) return res.status(404).json({ error: "room_not_found" });
+  const count = await pool.query("SELECT COUNT(*)::int AS count FROM room_players WHERE room_id = $1", [room.rows[0].id]);
+  if (count.rows[0].count >= room.rows[0].max_players) return res.status(409).json({ error: "room_full" });
+  await pool.query(
+    `INSERT INTO room_players (room_id, user_id)
+     VALUES ($1, $2)
+     ON CONFLICT (room_id, user_id) DO NOTHING`,
+    [room.rows[0].id, payload.sub],
+  );
+  res.json({ joined: true, room: room.rows[0] });
+});
+
+app.get("/v1/multiplayer/rooms/:roomCode", async (req, res) => {
+  const payload = requireAuth(req, res);
+  if (!payload) return;
+  const room = await pool.query("SELECT * FROM game_rooms WHERE room_code = $1", [String(req.params.roomCode || "").toUpperCase()]);
+  if (room.rowCount === 0) return res.status(404).json({ error: "room_not_found" });
+  const players = await pool.query(
+    `SELECT u.id, u.nickname, rp.is_host, rp.is_ready, rp.joined_at
+     FROM room_players rp
+     JOIN users u ON u.id = rp.user_id
+     WHERE rp.room_id = $1
+     ORDER BY rp.is_host DESC, rp.joined_at ASC`,
+    [room.rows[0].id],
+  );
+  res.json({ room: room.rows[0], players: players.rows });
+});
+
+app.post("/v1/multiplayer/rooms/:roomCode/ready", async (req, res) => {
+  const payload = requireAuth(req, res);
+  if (!payload) return;
+  const ready = Boolean(req.body.ready);
+  const result = await pool.query(
+    `UPDATE room_players rp
+     SET is_ready = $1
+     FROM game_rooms gr
+     WHERE gr.id = rp.room_id AND gr.room_code = $2 AND rp.user_id = $3
+     RETURNING rp.room_id, rp.user_id, rp.is_ready`,
+    [ready, String(req.params.roomCode || "").toUpperCase(), payload.sub],
+  );
+  if (result.rowCount === 0) return res.status(404).json({ error: "room_player_not_found" });
+  res.json({ ready });
+});
+
+app.post("/v1/multiplayer/rooms/:roomCode/start", async (req, res) => {
+  const payload = requireAuth(req, res);
+  if (!payload) return;
+  const roomCode = String(req.params.roomCode || "").toUpperCase();
+  const room = await pool.query("SELECT * FROM game_rooms WHERE room_code = $1", [roomCode]);
+  if (room.rowCount === 0) return res.status(404).json({ error: "room_not_found" });
+  if (room.rows[0].host_id !== payload.sub) return res.status(403).json({ error: "host_only" });
+  const players = await pool.query("SELECT is_ready FROM room_players WHERE room_id = $1", [room.rows[0].id]);
+  if (players.rowCount < 2) return res.status(409).json({ error: "not_enough_players" });
+  if (players.rows.some(p => !p.is_ready)) return res.status(409).json({ error: "not_all_ready" });
+  await pool.query("UPDATE game_rooms SET status = 'playing' WHERE id = $1", [room.rows[0].id]);
+  res.json({ started: true, room_code: roomCode, mode: room.rows[0].mode });
 });
 
 // ─── V1: Wallet ───────────────────────────────────────────────────────────────
@@ -414,7 +781,7 @@ app.get("/v1/wallet", async (req, res) => {
   if (!payload) return;
   const r = await pool.query("SELECT coin_balance FROM users WHERE id = $1", [payload.sub]);
   if (r.rowCount === 0) return res.status(401).json({ error: "user_not_found" });
-  res.json({ coins: r.rows[0].coin_balance });
+  res.json({ coins: r.rows[0].coin_balance, balance: r.rows[0].coin_balance });
 });
 
 // ─── V1: Attendance ───────────────────────────────────────────────────────────
@@ -793,6 +1160,149 @@ app.post("/v1/wallet/ad-reward", async (req, res) => {
   res.json({ coins_added: 15, new_balance: newBalance, used_today: usedToday + 1, limit: 5 });
 });
 
+// ─── Socket.io Realtime Multiplayer ──────────────────────────────────────────
+
+io.use((socket, next) => {
+  const token = String(socket.handshake.auth?.token || socket.handshake.query?.token || "");
+  const payload = verifyAuthToken(token);
+  if (!payload) return next(new Error("invalid_token"));
+  socket.data.userId = payload.sub;
+  socket.data.nickname = payload.nickname || payload.username || "Player";
+  next();
+});
+
+io.on("connection", (socket) => {
+  socket.on("room:create", async (data, ack) => {
+    try {
+      const mode = cleanModeId(data?.mode);
+      if (!["tag", "zombie"].includes(mode)) return safeAck(ack, { ok: false, error: "unsupported_mode" });
+      const maxPlayers = Math.min(6, Math.max(2, Number.parseInt(data?.max_players, 10) || 6));
+      const roomCode = makeRoomCode();
+      const room = {
+        code: roomCode,
+        mode,
+        host_id: socket.data.userId,
+        max_players: maxPlayers,
+        status: "waiting",
+        players: new Map(),
+        created_at: Date.now(),
+      };
+      realtimeRooms.set(roomCode, room);
+      addRealtimePlayer(room, socket);
+      socket.join(roomCode);
+      safeAck(ack, { ok: true, room: serializeRealtimeRoom(room) });
+      io.to(roomCode).emit("room:state", serializeRealtimeRoom(room));
+    } catch (error) {
+      safeAck(ack, { ok: false, error: "room_create_failed" });
+    }
+  });
+
+  socket.on("room:join", (data, ack) => {
+    const roomCode = String(data?.room_code || "").trim().toUpperCase();
+    const room = realtimeRooms.get(roomCode);
+    if (!room || room.status !== "waiting") return safeAck(ack, { ok: false, error: "room_not_found" });
+    if (room.players.size >= room.max_players) return safeAck(ack, { ok: false, error: "room_full" });
+    addRealtimePlayer(room, socket);
+    socket.join(roomCode);
+    safeAck(ack, { ok: true, room: serializeRealtimeRoom(room) });
+    io.to(roomCode).emit("room:state", serializeRealtimeRoom(room));
+  });
+
+  socket.on("player:ready", (data) => {
+    const room = getSocketRoom(socket);
+    if (!room) return;
+    const player = room.players.get(socket.id);
+    if (!player) return;
+    player.ready = Boolean(data?.ready);
+    io.to(room.code).emit("room:state", serializeRealtimeRoom(room));
+  });
+
+  socket.on("match:start", () => {
+    const room = getSocketRoom(socket);
+    if (!room || room.host_id !== socket.data.userId || room.players.size < 2) return;
+    room.status = "playing";
+    if (room.mode === "tag") assignInitialTagger(room);
+    if (room.mode === "zombie") assignInitialZombie(room);
+    io.to(room.code).emit("match:start", serializeRealtimeRoom(room));
+  });
+
+  socket.on("player:state", (state) => {
+    const room = getSocketRoom(socket);
+    if (!room || room.status !== "playing") return;
+    const player = room.players.get(socket.id);
+    if (!player) return;
+    player.x = Number(state?.x) || 0;
+    player.y = Number(state?.y) || 0;
+    player.vx = Number(state?.vx) || 0;
+    player.vy = Number(state?.vy) || 0;
+    player.stunned_until = Math.max(player.stunned_until || 0, Number(state?.stunned_until) || 0);
+    socket.to(room.code).emit("player:state", {
+      user_id: player.user_id,
+      nickname: player.nickname,
+      x: player.x,
+      y: player.y,
+      vx: player.vx,
+      vy: player.vy,
+      role: player.role,
+      stunned_until: player.stunned_until || 0,
+    });
+  });
+
+  socket.on("tag:touch", (data) => {
+    const room = getSocketRoom(socket);
+    if (!room || room.mode !== "tag" || room.status !== "playing") return;
+    const tagger = room.players.get(socket.id);
+    if (!tagger || tagger.role !== "tagger") return;
+    const target = findRealtimePlayerByUserId(room, String(data?.target_user_id || ""));
+    if (!target || target.role === "tagger") return;
+    if (Date.now() < Number(target.stunned_until || 0)) return;
+    target.role = "tagger";
+    io.to(room.code).emit("tag:infected", { user_id: target.user_id });
+    checkTagWin(room);
+  });
+
+  socket.on("zombie:infect", (data) => {
+    const room = getSocketRoom(socket);
+    if (!room || room.mode !== "zombie" || room.status !== "playing") return;
+    const zombie = room.players.get(socket.id);
+    if (!zombie || zombie.role !== "zombie") return;
+    const target = findRealtimePlayerByUserId(room, String(data?.target_user_id || ""));
+    if (!target || target.role === "zombie") return;
+    target.role = "zombie";
+    io.to(room.code).emit("zombie:infected", { user_id: target.user_id });
+    checkZombieWin(room);
+  });
+
+  socket.on("laser:stun", () => {
+    const room = getSocketRoom(socket);
+    if (!room || room.status !== "playing") return;
+    const player = room.players.get(socket.id);
+    if (!player) return;
+    player.stunned_until = Date.now() + 3000;
+    io.to(room.code).emit("player:stunned", { user_id: player.user_id, stunned_until: player.stunned_until });
+  });
+
+  socket.on("match:finish", async (data, ack) => {
+    const room = getSocketRoom(socket);
+    if (!room) return safeAck(ack, { ok: false, error: "room_not_found" });
+    try {
+      await saveMultiplayerResult(room, socket.data.userId, data);
+      safeAck(ack, { ok: true });
+    } catch (error) {
+      safeAck(ack, { ok: false, error: "result_save_failed" });
+    }
+  });
+
+  socket.on("disconnect", () => {
+    const room = getSocketRoom(socket);
+    if (!room) return;
+    room.players.delete(socket.id);
+    socket.leave(room.code);
+    if (room.players.size === 0) realtimeRooms.delete(room.code);
+    else io.to(room.code).emit("room:state", serializeRealtimeRoom(room));
+  });
+});
+
 // ─── Error Handler ────────────────────────────────────────────────────────────
 
 app.use((error, _req, res, _next) => {
@@ -801,6 +1311,97 @@ app.use((error, _req, res, _next) => {
 });
 
 // ─── Internal Helpers ─────────────────────────────────────────────────────────
+
+function safeAck(ack, payload) {
+  if (typeof ack === "function") ack(payload);
+}
+
+function addRealtimePlayer(room, socket) {
+  socket.data.roomCode = room.code;
+  room.players.set(socket.id, {
+    socket_id: socket.id,
+    user_id: socket.data.userId,
+    nickname: socket.data.nickname,
+    ready: room.host_id === socket.data.userId,
+    role: "survivor",
+    x: 0,
+    y: 0,
+    vx: 0,
+    vy: 0,
+    stunned_until: 0,
+  });
+}
+
+function getSocketRoom(socket) {
+  const roomCode = String(socket.data.roomCode || "");
+  if (!roomCode) return null;
+  return realtimeRooms.get(roomCode) || null;
+}
+
+function serializeRealtimeRoom(room) {
+  return {
+    code: room.code,
+    mode: room.mode,
+    host_id: room.host_id,
+    max_players: room.max_players,
+    status: room.status,
+    players: [...room.players.values()].map(p => ({
+      user_id: p.user_id,
+      nickname: p.nickname,
+      ready: p.ready,
+      role: p.role,
+      x: p.x,
+      y: p.y,
+      stunned_until: p.stunned_until || 0,
+    })),
+  };
+}
+
+function findRealtimePlayerByUserId(room, userId) {
+  for (const player of room.players.values()) {
+    if (player.user_id === userId) return player;
+  }
+  return null;
+}
+
+function assignInitialTagger(room) {
+  const players = [...room.players.values()];
+  for (const p of players) p.role = "runner";
+  if (players.length > 0) players[Math.floor(Math.random() * players.length)].role = "tagger";
+}
+
+function assignInitialZombie(room) {
+  const players = [...room.players.values()];
+  for (const p of players) p.role = "survivor";
+  if (players.length > 0) players[Math.floor(Math.random() * players.length)].role = "zombie";
+}
+
+function checkTagWin(room) {
+  const runners = [...room.players.values()].filter(p => p.role !== "tagger");
+  if (runners.length <= 1) {
+    room.status = "finished";
+    io.to(room.code).emit("match:finished", { mode: room.mode, winner_user_ids: runners.map(p => p.user_id), reason: "last_runner" });
+  }
+}
+
+function checkZombieWin(room) {
+  const survivors = [...room.players.values()].filter(p => p.role !== "zombie");
+  if (survivors.length <= 1) {
+    room.status = "finished";
+    io.to(room.code).emit("match:finished", { mode: room.mode, winner_user_ids: survivors.map(p => p.user_id), reason: survivors.length === 0 ? "zombie_team" : "last_survivor" });
+  }
+}
+
+async function saveMultiplayerResult(room, userId, data) {
+  const rank = Math.max(1, Number.parseInt(data?.rank, 10) || 1);
+  const score = Math.max(0, Number.parseInt(data?.score, 10) || 0);
+  const survivedSeconds = Math.max(0, Number(data?.survived_seconds) || 0);
+  await pool.query(
+    `INSERT INTO multiplayer_results (room_id, user_id, mode, rank, score, survived_seconds)
+     VALUES (NULL, $1, $2, $3, $4, $5)`,
+    [userId, room.mode, rank, score, survivedSeconds],
+  );
+}
 
 async function getUserStats(userId) {
   await ensureUserGameStats(userId);
@@ -928,38 +1529,41 @@ async function getDailyQuestProgress(userId, stats, today) {
   });
 }
 
-async function getRank(totalScore, survivalTime) {
+async function getRank(totalScore, survivalTime, mode = "classic") {
   const result = await pool.query(
     `SELECT COUNT(*)::int + 1 AS rank
      FROM (
        SELECT DISTINCT ON (user_id) user_id, total_score, survival_time
-       FROM scores
+       FROM mode_scores
+       WHERE mode = $3
        ORDER BY user_id, total_score DESC, survival_time DESC, created_at ASC
      ) best_scores
      WHERE total_score > $1
         OR (total_score = $1 AND survival_time > $2)`,
-    [totalScore, survivalTime],
+    [totalScore, survivalTime, cleanModeId(mode)],
   );
   return result.rows[0].rank;
 }
 
-async function getUserBestScore(userId) {
+async function getUserBestScore(userId, mode = "classic") {
   const result = await pool.query(
-    `SELECT nickname, total_score, survival_time, p_score, created_at
-     FROM scores WHERE user_id = $1
+    `SELECT nickname, total_score, survival_time, p_score, mode, metric_primary, metric_secondary, mode_data, created_at
+     FROM mode_scores WHERE user_id = $1 AND mode = $2
      ORDER BY total_score DESC, survival_time DESC, created_at ASC LIMIT 1`,
-    [userId],
+    [userId, cleanModeId(mode)],
   );
   return result.rowCount === 0 ? null : result.rows[0];
 }
 
-function isPlausibleScore(totalScore, survivalTime, pScore) {
-  const expectedTotal = Math.floor(survivalTime * 10) + pScore;
-  const maxPScore = Math.ceil(survivalTime / 1.0) * 100 + 300;
+function isPlausibleScore(totalScore, survivalTime, pScore, modeScoreBonus = 0) {
+  const expectedTotal = Math.floor(survivalTime * 10) + pScore + modeScoreBonus;
+  const maxPScore = Math.ceil(survivalTime / 1.0) * 500 + 5000;
+  const maxBonus = Math.ceil(survivalTime / 1.0) * 2500 + 20000;
   return (
     survivalTime >= 0 && survivalTime < 60 * 60 &&
-    pScore >= 0 && pScore % 100 === 0 && pScore <= maxPScore &&
-    Math.abs(totalScore - expectedTotal) <= 5
+    pScore >= 0 && pScore <= maxPScore &&
+    modeScoreBonus >= 0 && modeScoreBonus <= maxBonus &&
+    Math.abs(totalScore - expectedTotal) <= 10
   );
 }
 
@@ -1118,9 +1722,38 @@ async function ensureSchema() {
       total_score INTEGER NOT NULL,
       survival_time REAL NOT NULL,
       p_score INTEGER NOT NULL,
+      mode TEXT NOT NULL DEFAULT 'classic',
+      mode_data JSONB NOT NULL DEFAULT '{}'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )`);
+  await pool.query("ALTER TABLE scores ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'classic'");
+  await pool.query("ALTER TABLE scores ADD COLUMN IF NOT EXISTS mode_data JSONB NOT NULL DEFAULT '{}'::jsonb");
   await pool.query("CREATE INDEX IF NOT EXISTS scores_rank_idx ON scores (total_score DESC, survival_time DESC, created_at ASC)");
+  await pool.query("CREATE INDEX IF NOT EXISTS scores_mode_rank_idx ON scores (mode, total_score DESC, survival_time DESC, created_at ASC)");
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mode_scores (
+      id BIGSERIAL PRIMARY KEY,
+      mode TEXT NOT NULL,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      nickname TEXT NOT NULL,
+      total_score INTEGER NOT NULL,
+      survival_time REAL NOT NULL,
+      p_score INTEGER NOT NULL DEFAULT 0,
+      metric_primary REAL NOT NULL DEFAULT 0,
+      metric_secondary INTEGER NOT NULL DEFAULT 0,
+      mode_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+      source_score_id BIGINT UNIQUE REFERENCES scores(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query("ALTER TABLE mode_scores ADD COLUMN IF NOT EXISTS mode_data JSONB NOT NULL DEFAULT '{}'::jsonb");
+  await pool.query("CREATE INDEX IF NOT EXISTS mode_scores_rank_idx ON mode_scores (mode, total_score DESC, survival_time DESC, created_at ASC)");
+  await pool.query("CREATE INDEX IF NOT EXISTS mode_scores_user_idx ON mode_scores (user_id, mode, total_score DESC)");
+  await pool.query(`
+    INSERT INTO mode_scores (mode, user_id, nickname, total_score, survival_time, p_score, mode_data, source_score_id, created_at)
+    SELECT mode, user_id, nickname, total_score, survival_time, p_score, mode_data, id, created_at
+    FROM scores
+    ON CONFLICT (source_score_id) DO NOTHING`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_game_stats (
@@ -1194,10 +1827,60 @@ async function ensureSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )`);
   await pool.query("CREATE INDEX IF NOT EXISTS coin_tx_user_idx ON coin_transactions (user_id, created_at DESC)");
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS friendships (
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      friend_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (user_id, friend_id),
+      CHECK (user_id <> friend_id)
+    )`);
+  await pool.query("CREATE INDEX IF NOT EXISTS friendships_friend_idx ON friendships (friend_id, status)");
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS game_rooms (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      room_code VARCHAR(6) NOT NULL UNIQUE,
+      host_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      mode TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'waiting',
+      max_players INTEGER NOT NULL DEFAULT 6,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query("CREATE INDEX IF NOT EXISTS game_rooms_code_idx ON game_rooms (room_code)");
+  await pool.query("CREATE INDEX IF NOT EXISTS game_rooms_mode_status_idx ON game_rooms (mode, status)");
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS room_players (
+      room_id UUID NOT NULL REFERENCES game_rooms(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      is_host BOOLEAN NOT NULL DEFAULT false,
+      is_ready BOOLEAN NOT NULL DEFAULT false,
+      joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (room_id, user_id)
+    )`);
+  await pool.query("CREATE INDEX IF NOT EXISTS room_players_user_idx ON room_players (user_id)");
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS multiplayer_results (
+      id BIGSERIAL PRIMARY KEY,
+      room_id UUID REFERENCES game_rooms(id) ON DELETE SET NULL,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      mode TEXT NOT NULL,
+      rank INTEGER NOT NULL,
+      score INTEGER NOT NULL DEFAULT 0,
+      survived_seconds REAL NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query("CREATE INDEX IF NOT EXISTS multiplayer_results_user_idx ON multiplayer_results (user_id, created_at DESC)");
 }
 
 await ensureSchema();
 
-app.listen(port, "0.0.0.0", () => {
+httpServer.listen(port, "0.0.0.0", () => {
   console.log(`Laser Dodge API v2 listening on http://0.0.0.0:${port}`);
 });
