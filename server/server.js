@@ -5,6 +5,7 @@ import express from "express";
 import http from "node:http";
 import pg from "pg";
 import { Server as SocketIOServer } from "socket.io";
+import { attachZombieMultiplayer } from "./src/socket/index.js";
 
 dotenv.config();
 
@@ -1877,9 +1878,50 @@ async function ensureSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )`);
   await pool.query("CREATE INDEX IF NOT EXISTS multiplayer_results_user_idx ON multiplayer_results (user_id, created_at DESC)");
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS zombie_rooms (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      room_code VARCHAR(6) UNIQUE NOT NULL,
+      host_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      status VARCHAR(20) DEFAULT 'waiting',
+      max_players INT DEFAULT 4,
+      created_at TIMESTAMPTZ DEFAULT now()
+    )`);
+  await pool.query("CREATE INDEX IF NOT EXISTS zombie_rooms_code_idx ON zombie_rooms (room_code)");
+  await pool.query("CREATE INDEX IF NOT EXISTS zombie_rooms_status_idx ON zombie_rooms (status, created_at DESC)");
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS zombie_players (
+      id BIGSERIAL PRIMARY KEY,
+      room_id UUID REFERENCES zombie_rooms(id) ON DELETE CASCADE,
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      is_host BOOLEAN DEFAULT false,
+      is_ready BOOLEAN DEFAULT false,
+      status VARCHAR(20) DEFAULT 'alive',
+      joined_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE (room_id, user_id)
+    )`);
+  await pool.query("CREATE INDEX IF NOT EXISTS zombie_players_room_idx ON zombie_players (room_id)");
+  await pool.query("CREATE INDEX IF NOT EXISTS zombie_players_user_idx ON zombie_players (user_id)");
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS zombie_results (
+      id BIGSERIAL PRIMARY KEY,
+      room_id UUID REFERENCES zombie_rooms(id) ON DELETE SET NULL,
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      rank INT NOT NULL,
+      survived_ms INT DEFAULT 0,
+      infected_count INT DEFAULT 0,
+      is_winner BOOLEAN DEFAULT false,
+      played_at TIMESTAMPTZ DEFAULT now()
+    )`);
+  await pool.query("CREATE INDEX IF NOT EXISTS zombie_results_user_idx ON zombie_results (user_id, played_at DESC)");
 }
 
 await ensureSchema();
+
+attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken, makeRoomCode });
 
 httpServer.listen(port, "0.0.0.0", () => {
   console.log(`Laser Dodge API v2 listening on http://0.0.0.0:${port}`);
