@@ -181,6 +181,7 @@ function normalizeModeData(mode, body = {}) {
   const common = {
     death_reason: cleanShortText(raw.death_reason || body.death_reason, 120),
     mode_score_bonus: Math.max(0, cleanInt(body.mode_score_bonus, 0)),
+    coins_earned: Math.max(0, cleanInt(raw.coins_earned ?? body.coins_earned, 0)),
   };
   if (mode === "food_chain") {
     return {
@@ -380,6 +381,23 @@ app.get("/auth/me", async (req, res) => {
   res.json({ user: result.rows[0] });
 });
 
+app.delete("/auth/me", async (req, res) => {
+  const payload = requireAuth(req, res);
+  if (!payload) return;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("DELETE FROM users WHERE id = $1", [payload.sub]);
+    await client.query("COMMIT");
+    res.json({ deleted: true });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/auth/session", (_req, res) => {
   const sessionId = randomUUID();
   const state = randomUUID();
@@ -455,6 +473,8 @@ app.post("/scores", async (req, res) => {
   const metricPrimary = Math.max(0, Number(req.body.mode_metric_primary) || 0);
   const metricSecondary = Math.max(0, Number.parseInt(req.body.mode_metric_secondary, 10) || 0);
   const modeData = normalizeModeData(mode, req.body);
+  const sessionCoinsEarned = Math.min(2000, Math.max(0, cleanInt(modeData.coins_earned, 0)));
+  modeData.coins_earned = sessionCoinsEarned;
 
   const inserted = await pool.query(
     `INSERT INTO scores (user_id, nickname, total_score, survival_time, p_score, mode, mode_data)
@@ -484,11 +504,16 @@ app.post("/scores", async (req, res) => {
     survivalTime, pCount, sCount, shieldBlocks, shieldActivations,
     maxCombo, usedRevival, wasBest, wasRevived: usedRevival,
   });
+  const coinBalance = sessionCoinsEarned > 0
+    ? await addCoins(user.id, sessionCoinsEarned, "game_pickup", String(inserted.rows[0].id))
+    : (await pool.query("SELECT coin_balance FROM users WHERE id = $1", [user.id])).rows[0].coin_balance;
 
   res.json({
     score: inserted.rows[0],
     mode_score: modeScore.rows[0],
     rank,
+    coins_awarded: sessionCoinsEarned,
+    coin_balance: coinBalance,
     achievements_unlocked: newlyUnlocked,
     daily_quests_updated: updatedDailyQuests,
   });
@@ -682,7 +707,7 @@ app.post("/v1/multiplayer/rooms", async (req, res) => {
   const payload = requireAuth(req, res);
   if (!payload) return;
   const mode = cleanModeId(req.body.mode);
-  if (!["tag", "zombie"].includes(mode)) return res.status(400).json({ error: "unsupported_mode" });
+  if (!["tag", "zombie", "battle_royale"].includes(mode)) return res.status(400).json({ error: "unsupported_mode" });
   const maxPlayers = Math.min(6, Math.max(2, Number.parseInt(req.body.max_players, 10) || 6));
   let room = null;
   for (let i = 0; i < 5; i++) {
@@ -1176,7 +1201,7 @@ io.on("connection", (socket) => {
   socket.on("room:create", async (data, ack) => {
     try {
       const mode = cleanModeId(data?.mode);
-      if (!["tag", "zombie"].includes(mode)) return safeAck(ack, { ok: false, error: "unsupported_mode" });
+      if (!["tag", "zombie", "battle_royale"].includes(mode)) return safeAck(ack, { ok: false, error: "unsupported_mode" });
       const maxPlayers = Math.min(6, Math.max(2, Number.parseInt(data?.max_players, 10) || 6));
       const roomCode = makeRoomCode();
       const room = {
@@ -1828,6 +1853,9 @@ async function ensureSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )`);
   await pool.query("CREATE INDEX IF NOT EXISTS coin_tx_user_idx ON coin_transactions (user_id, created_at DESC)");
+  await pool.query(
+    "CREATE UNIQUE INDEX IF NOT EXISTS coin_tx_unique_user_reason_ref_idx ON coin_transactions (user_id, reason, ref_id) WHERE ref_id IS NOT NULL",
+  );
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS friendships (
