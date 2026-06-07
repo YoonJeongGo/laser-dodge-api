@@ -283,6 +283,15 @@ function makeRoomCode() {
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 
+app.get("/", (_req, res) => {
+  res.json({
+    name: "Laser Dodge API",
+    ok: true,
+    health: "/health",
+    version: "1.0.0",
+  });
+});
+
 app.get("/health", async (_req, res) => {
   await pool.query("SELECT 1");
   res.json({ ok: true });
@@ -1331,12 +1340,31 @@ io.on("connection", (socket) => {
 
 // ─── Error Handler ────────────────────────────────────────────────────────────
 
+wrapExpress4AsyncRoutes(app);
+
 app.use((error, _req, res, _next) => {
   console.error(error);
+  if (res.headersSent) return;
   res.status(500).json({ error: "server_error" });
 });
 
 // ─── Internal Helpers ─────────────────────────────────────────────────────────
+
+function wrapExpress4AsyncRoutes(expressApp) {
+  const stack = expressApp?._router?.stack || [];
+  for (const layer of stack) {
+    if (!layer.route?.stack) continue;
+    for (const routeLayer of layer.route.stack) {
+      const original = routeLayer.handle;
+      if (typeof original !== "function" || original.length > 3 || original._asyncWrapped) continue;
+      const wrapped = function wrappedAsyncRoute(req, res, next) {
+        Promise.resolve(original(req, res, next)).catch(next);
+      };
+      wrapped._asyncWrapped = true;
+      routeLayer.handle = wrapped;
+    }
+  }
+}
 
 function safeAck(ack, payload) {
   if (typeof ack === "function") ack(payload);
