@@ -156,6 +156,11 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     const openRoom = findOpenQuickRoom(mode, tagVariant);
     if (openRoom) {
       addPlayerToRoom(openRoom, client, false);
+      const quickPlayer = openRoom.players.get(client.userId);
+      if (quickPlayer) {
+        quickPlayer.returnedToLobby = true;
+        quickPlayer.ready = true;
+      }
       await persistRoomPlayer(openRoom, client.userId, false);
       const payload = { ok: true, room: serializeRoom(openRoom), quick_match: true };
       client.send("room_joined", payload);
@@ -382,13 +387,20 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       broadcastRoom(room, "room_updated", serializeRoom(room));
       return;
     }
-    if (!allPlayersReturnedToLobby(room) || [...room.players.values()].some((player) => !player.ready)) {
+    const full = room.players.size >= room.maxPlayers;
+    if (!full) {
       clearFullRoomAutoStart(room);
       broadcastRoom(room, "room_updated", serializeRoom(room));
       return;
     }
-    const full = room.players.size >= room.maxPlayers;
-    if (!full) {
+    const isQuickStartRoom = room.quick || room.quickMatchRoom;
+    if (isQuickStartRoom) {
+      for (const player of room.players.values()) {
+        player.returnedToLobby = true;
+        player.ready = true;
+      }
+    }
+    if (!allPlayersReturnedToLobby(room) || (!isQuickStartRoom && [...room.players.values()].some((player) => !player.ready))) {
       clearFullRoomAutoStart(room);
       broadcastRoom(room, "room_updated", serializeRoom(room));
       return;
@@ -410,7 +422,14 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
         broadcastRoom(room, "room_updated", serializeRoom(room));
         return;
       }
-      if (!allPlayersReturnedToLobby(room) || [...room.players.values()].some((player) => !player.ready)) {
+      const isQuickStartRoom = room.quick || room.quickMatchRoom;
+      if (isQuickStartRoom) {
+        for (const player of room.players.values()) {
+          player.returnedToLobby = true;
+          player.ready = true;
+        }
+      }
+      if (!allPlayersReturnedToLobby(room) || (!isQuickStartRoom && [...room.players.values()].some((player) => !player.ready))) {
         room.autoStartAt = 0;
         broadcastRoom(room, "room_updated", serializeRoom(room));
         return;
