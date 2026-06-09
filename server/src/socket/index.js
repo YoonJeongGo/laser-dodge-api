@@ -382,6 +382,11 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
 
   function updateFullRoomAutoStart(room) {
     if (!room || room.status !== "waiting") return;
+    if (room.awaitingLobbyReturn) {
+      clearFullRoomAutoStart(room);
+      broadcastRoom(room, "room_updated", serializeRoom(room));
+      return;
+    }
     if (room.mode === "tag" && room.players.size < TAG_MATCH_SIZE) {
       clearFullRoomAutoStart(room);
       broadcastRoom(room, "room_updated", serializeRoom(room));
