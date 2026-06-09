@@ -5,7 +5,7 @@ const TAG_MATCH_SIZE = 6;
 const BATTLE_ROYALE_MATCH_SIZE = 6;
 const MIN_MATCH_SIZE = 2;
 const QUICK_MATCH_TIMEOUT_MS = 30_000;
-const POSITION_SYNC_MS = 33;
+const POSITION_SYNC_MS = 15;
 const FIRST_ZOMBIE_DELAY_MS = 30_000;
 const TOUCH_RADIUS = 30;
 const TAG_ROUND_MS = 120_000;
@@ -38,7 +38,7 @@ const TAG_SENTINEL_MS = 18_000;
 const TAG_CLONE_MS = 5_000;
 const TAG_SPEED_ITEM_MS = 6_000;
 const TAG_SMOKE_MS = 4_000;
-const POSITION_MIN_INTERVAL_MS = 25;
+const POSITION_MIN_INTERVAL_MS = 12;
 const POSITION_MAX_ABS = 200_000;
 const POSITION_MAX_SPEED = 1_600;
 const POSITION_GRACE_DISTANCE = 90;
@@ -787,6 +787,9 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     if (now < (room.tagActiveAt || room.startedAt)) return;
     const jailed = [...room.players.values()].filter((player) => player.status === "jailed");
     if (jailed.length === 0) {
+      if (room.tagRescue && room.tagRescue.startedAt) {
+        broadcastRoom(room, "tag_event", { type: "rescue_cancelled", room: serializeRoom(room) });
+      }
       room.tagRescue = { rescuerId: "", startedAt: 0, targetId: "" };
       return;
     }
@@ -796,6 +799,9 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       hasFreshPosition(player, now)
     );
     if (rescuers.length === 0) {
+      if (room.tagRescue && room.tagRescue.startedAt) {
+        broadcastRoom(room, "tag_event", { type: "rescue_cancelled", room: serializeRoom(room) });
+      }
       room.tagRescue = { rescuerId: "", startedAt: 0, targetId: "" };
       return;
     }
@@ -807,6 +813,14 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     const target = jailed.sort((a, b) => (a.jailedAt || 0) - (b.jailedAt || 0))[0];
     if (!room.tagRescue || room.tagRescue.rescuerId !== rescuer.userId || room.tagRescue.targetId !== target.userId) {
       room.tagRescue = { rescuerId: rescuer.userId, targetId: target.userId, startedAt: now };
+      broadcastRoom(room, "tag_event", {
+        type: "rescue_started",
+        user_id: target.userId,
+        by_user_id: rescuer.userId,
+        nickname: target.nickname,
+        by_nickname: rescuer.nickname,
+        room: serializeRoom(room),
+      });
     }
     if (now - room.tagRescue.startedAt < TAG_RESCUE_MS) return;
     target.status = "runner";
