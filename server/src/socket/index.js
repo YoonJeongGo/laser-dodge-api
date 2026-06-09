@@ -314,6 +314,9 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     if (!room) return sendRequestFailed(client, null, "start_game", "room_not_found");
     if (room.status !== "waiting") return sendRequestFailed(client, null, "start_game", "room_not_waiting");
     if (room.hostId !== client.userId) return sendRequestFailed(client, null, "start_game", "not_host");
+    if (room.mode === "tag" && room.players.size < TAG_MATCH_SIZE) {
+      return sendRequestFailed(client, null, "start_game", "tag_needs_six_players");
+    }
     if (room.players.size < 2) return sendRequestFailed(client, null, "start_game", "not_enough_players");
     if ([...room.players.values()].some((player) => !player.ready)) {
       return sendRequestFailed(client, null, "start_game", "players_not_ready");
@@ -323,6 +326,11 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
 
   function startRoom(room) {
     if (room.status === "playing") return;
+    if (room.mode === "tag" && room.players.size < TAG_MATCH_SIZE) {
+      clearFullRoomAutoStart(room);
+      broadcastRoom(room, "room_updated", serializeRoom(room));
+      return;
+    }
     clearFullRoomAutoStart(room);
     room.status = "playing";
     room.startedAt = Date.now();
@@ -351,6 +359,11 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
 
   function updateFullRoomAutoStart(room) {
     if (!room || room.status !== "waiting") return;
+    if (room.mode === "tag" && room.players.size < TAG_MATCH_SIZE) {
+      clearFullRoomAutoStart(room);
+      broadcastRoom(room, "room_updated", serializeRoom(room));
+      return;
+    }
     const full = room.players.size >= room.maxPlayers;
     if (!full) {
       clearFullRoomAutoStart(room);
@@ -364,6 +377,11 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       room.autoStartTimer = null;
       if (!rooms.has(room.code)) return;
       if (room.status !== "waiting") return;
+      if (room.mode === "tag" && room.players.size < TAG_MATCH_SIZE) {
+        room.autoStartAt = 0;
+        broadcastRoom(room, "room_updated", serializeRoom(room));
+        return;
+      }
       if (room.players.size < room.maxPlayers) {
         room.autoStartAt = 0;
         broadcastRoom(room, "room_updated", serializeRoom(room));
