@@ -12,6 +12,32 @@ const TAG_ROUND_MS = 120_000;
 const TAG_IMMUNITY_MS = 1_200;
 const TAG_TOUCH_COOLDOWN_MS = 300;
 const TAG_STALE_POSITION_MS = 1_500;
+const TAG_TAGGER_COUNT = 2;
+const TAG_RUNNER_WIN_SURVIVORS = 1;
+const TAG_PRISON = { x: 0, y: 0 };
+const TAG_PRISON_RADIUS = 96;
+const TAG_RESCUE_RADIUS = 118;
+const TAG_RESCUE_MS = 5_000;
+const TAG_BOOST_MS = 3_500;
+const TAG_BOOST_COOLDOWN_MS = 12_000;
+const TAG_DASH_MS = 420;
+const TAG_DASH_COOLDOWN_MS = 9_000;
+const TAG_ITEM_SELECT_MS = 10_000;
+const TAG_HUNTER_ITEMS = new Set(["hunter_missile", "hunter_radar", "prison_sentinel"]);
+const TAG_RUNNER_ITEMS = new Set(["runner_clone", "runner_speed_points", "runner_smoke"]);
+const TAG_ITEM_DEFAULTS = { tagger: "hunter_radar", runner: "runner_clone" };
+const TAG_ITEM_COOLDOWNS = {
+  hunter_missile: 14_000,
+  prison_sentinel: 20_000,
+  runner_clone: 18_000,
+  runner_speed_points: 12_000,
+  runner_smoke: 16_000,
+};
+const TAG_MISSILE_SLOW_MS = 2_500;
+const TAG_SENTINEL_MS = 18_000;
+const TAG_CLONE_MS = 5_000;
+const TAG_SPEED_ITEM_MS = 6_000;
+const TAG_SMOKE_MS = 4_000;
 const POSITION_MIN_INTERVAL_MS = 25;
 const POSITION_MAX_ABS = 200_000;
 const POSITION_MAX_SPEED = 1_600;
@@ -24,7 +50,7 @@ const BR_ZONE_SHRINK_MS = 120_000;
 const BR_ZONE_DAMAGE_INTERVAL_MS = 1000;
 const BR_SPAWN_RADIUS = 900;
 
-export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken, makeRoomCode }) {
+export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken, makeRoomCode, onlineUserIds = new Set() }) {
   const rooms = new Map();
   const quickQueue = [];
   const clientsByUserId = new Map();
@@ -64,6 +90,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       removeFromCurrentRoom(existing);
     }
     clientsByUserId.set(client.userId, client);
+    onlineUserIds.add(client.userId);
     client.on("quick_match", (data) => joinQuickMatch(client, data));
     client.on("cancel_quick_match", () => leaveQuickMatch(client, true));
     client.on("create_room", (data, ack) => createRoom(client, data, ack));
@@ -76,6 +103,9 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     client.on("position_update", (data) => updatePosition(client, data));
     client.on("player_infected", (data) => requestInfection(client, data));
     client.on("tag_touch", (data) => requestTagTouch(client, data));
+    client.on("tag_ability", () => requestTagAbility(client));
+    client.on("tag_item_select", (data) => requestTagItemSelect(client, data));
+    client.on("tag_item_use", () => requestTagItemUse(client));
     client.on("br_damage", (data) => requestBattleRoyaleDamage(client, data));
     client.on("game_over", (data, ack) => finishGame(client, data, ack));
     client.onClose(() => disconnectClient(client));
@@ -85,9 +115,11 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     const mode = normalizeMultiplayerMode(data.mode);
     const defaultMax = maxPlayersForMode(mode);
     const maxPlayers = clampInt(data.max_players, 2, defaultMax, defaultMax);
-    const room = makeRoom(mode, client, maxPlayers, false);
+    const tagVariant = mode === "tag" ? normalizeTagVariant(data.tag_variant || data.settings?.tag_variant) : "basic";
+    const room = makeRoom(mode, client, maxPlayers, false, tagVariant);
     room.private = Boolean(data.private);
     room.settings = cleanRoomSettings(data.settings);
+    room.settings.tag_variant = tagVariant;
     await persistRoom(room, client.userId);
     addPlayerToRoom(room, client, true);
     await persistRoomPlayer(room, client.userId, true);
@@ -95,6 +127,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     sendAck(ack, { ok: true, room: serializeRoom(room) });
     client.send("room_created", { room: serializeRoom(room), room_code: room.code });
     broadcastRoom(room, "room_updated", serializeRoom(room));
+    updateFullRoomAutoStart(room);
   }
 
   async function joinRoom(client, data = {}, ack = null) {
@@ -111,18 +144,50 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     sendAck(ack, payload);
     client.send("room_joined", payload);
     broadcastRoom(room, "room_updated", serializeRoom(room));
+    updateFullRoomAutoStart(room);
   }
 
   async function joinQuickMatch(client, data = {}) {
     leaveQuickMatch(client, false);
     const mode = normalizeMultiplayerMode(data.mode);
-    const matchSize = quickMatchSizeForMode(mode);
-    const entry = { client, mode, joinedAt: Date.now(), timer: null };
-    quickQueue.push(entry);
-    entry.timer = setTimeout(() => startQuickMatchFromEntry(entry), QUICK_MATCH_TIMEOUT_MS);
+    const tagVariant = mode === "tag" ? normalizeTagVariant(data.tag_variant) : "basic";
+    const openRoom = findOpenQuickRoom(mode, tagVariant);
+    if (openRoom) {
+      addPlayerToRoom(openRoom, client, false);
+      await persistRoomPlayer(openRoom, client.userId, false);
+      const payload = { ok: true, room: serializeRoom(openRoom), quick_match: true };
+      client.send("room_joined", payload);
+      broadcastRoom(openRoom, "room_updated", serializeRoom(openRoom));
+      updateFullRoomAutoStart(openRoom);
+      emitQuickQueue();
+      return;
+    }
+
+    const room = makeRoom(mode, client, quickMatchSizeForMode(mode), false, tagVariant);
+    room.settings.tag_variant = tagVariant;
+    room.quickMatchRoom = true;
+    await persistRoom(room, client.userId);
+    addPlayerToRoom(room, client, true);
+    await persistRoomPlayer(room, client.userId, true);
+    client.roomCode = room.code;
+    const payload = { ok: true, room: serializeRoom(room), room_code: room.code, quick_match: true };
+    client.send("room_created", payload);
+    broadcastRoom(room, "room_updated", serializeRoom(room));
+    updateFullRoomAutoStart(room);
     emitQuickQueue();
-    const matching = quickQueue.filter((queued) => queued.mode === mode);
-    if (matching.length >= matchSize) startQuickMatch(takeQuickMatchEntries(mode, matchSize));
+  }
+
+  function findOpenQuickRoom(mode, tagVariant = "basic") {
+    let fallbackRoom = null;
+    for (const room of rooms.values()) {
+      if (room.private) continue;
+      if (room.status !== "waiting") continue;
+      if (room.mode !== mode) continue;
+      if (room.players.size >= room.maxPlayers) continue;
+      if ((room.tagVariant || "basic") === tagVariant) return room;
+      if (!fallbackRoom) fallbackRoom = room;
+    }
+    return fallbackRoom;
   }
 
   function leaveQuickMatch(client, notify) {
@@ -130,7 +195,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     if (idx >= 0) {
       const [entry] = quickQueue.splice(idx, 1);
       clearTimeout(entry.timer);
-      if (notify) client.send("room_updated", { queue_count: 0, max_players: quickMatchSizeForMode(entry.mode), mode: entry.mode, cancelled: true });
+      if (notify) client.send("room_updated", { queue_count: 0, max_players: quickMatchSizeForMode(entry.mode), mode: entry.mode, tag_variant: entry.tagVariant || "basic", cancelled: true });
       emitQuickQueue();
     }
   }
@@ -138,18 +203,20 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
   function startQuickMatchFromEntry(entry) {
     if (!quickQueue.includes(entry)) return;
     const matchSize = quickMatchSizeForMode(entry.mode);
-    const count = Math.min(matchSize, quickQueue.filter((queued) => queued.mode === entry.mode).length);
+    const key = quickMatchKey(entry.mode, entry.tagVariant);
+    const count = Math.min(matchSize, quickQueue.filter((queued) => quickMatchKey(queued.mode, queued.tagVariant) === key).length);
     if (count < MIN_MATCH_SIZE) {
       entry.timer = setTimeout(() => startQuickMatchFromEntry(entry), QUICK_MATCH_TIMEOUT_MS);
       entry.client.send("room_updated", {
         queue_count: count,
         max_players: matchSize,
         mode: entry.mode,
+        tag_variant: entry.tagVariant || "basic",
         waiting_for_players: true,
       });
       return;
     }
-    const group = takeQuickMatchEntries(entry.mode, count);
+    const group = takeQuickMatchEntries(entry.mode, count, entry.tagVariant);
     startQuickMatch(group);
   }
 
@@ -158,7 +225,9 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     for (const entry of entries) clearTimeout(entry.timer);
     const host = entries[0].client;
     const mode = entries[0].mode || "zombie";
-    const room = makeRoom(mode, host, quickMatchSizeForMode(mode), true);
+    const tagVariant = mode === "tag" ? normalizeTagVariant(entries[0].tagVariant) : "basic";
+    const room = makeRoom(mode, host, quickMatchSizeForMode(mode), true, tagVariant);
+    room.settings.tag_variant = tagVariant;
     await persistRoom(room, host.userId);
     for (const entry of entries) {
       addPlayerToRoom(room, entry.client, entry.client === host);
@@ -172,15 +241,17 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
 
   function emitQuickQueue() {
     for (const entry of quickQueue) {
-      const queueCount = quickQueue.filter((queued) => queued.mode === entry.mode).length;
-      entry.client.send("room_updated", { queue_count: queueCount, max_players: quickMatchSizeForMode(entry.mode), mode: entry.mode });
+      const key = quickMatchKey(entry.mode, entry.tagVariant);
+      const queueCount = quickQueue.filter((queued) => quickMatchKey(queued.mode, queued.tagVariant) === key).length;
+      entry.client.send("room_updated", { queue_count: queueCount, max_players: quickMatchSizeForMode(entry.mode), mode: entry.mode, tag_variant: entry.tagVariant || "basic" });
     }
   }
 
-  function takeQuickMatchEntries(mode, count) {
+  function takeQuickMatchEntries(mode, count, tagVariant = "basic") {
     const entries = [];
+    const key = quickMatchKey(mode, tagVariant);
     for (let i = 0; i < quickQueue.length && entries.length < count;) {
-      if (quickQueue[i].mode !== mode) {
+      if (quickMatchKey(quickQueue[i].mode, quickQueue[i].tagVariant) !== key) {
         i += 1;
         continue;
       }
@@ -196,7 +267,9 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     let room = getClientRoom(client);
     if (!room) {
       const mode = normalizeMultiplayerMode(data.mode);
-      room = makeRoom(mode, client, quickMatchSizeForMode(mode), false);
+      const tagVariant = mode === "tag" ? normalizeTagVariant(data.tag_variant) : "basic";
+      room = makeRoom(mode, client, quickMatchSizeForMode(mode), false, tagVariant);
+      room.settings.tag_variant = tagVariant;
       addPlayerToRoom(room, client, true);
       persistRoom(room, client.userId).then(() => persistRoomPlayer(room, client.userId, true)).catch((error) => {
         console.error("[invite] persist room failed", {
@@ -232,6 +305,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     if (!player) return;
     player.ready = Boolean(data.ready);
     broadcastRoom(room, "room_updated", serializeRoom(room));
+    updateFullRoomAutoStart(room);
   }
 
   function startGameByHost(client) {
@@ -248,6 +322,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
 
   function startRoom(room) {
     if (room.status === "playing") return;
+    clearFullRoomAutoStart(room);
     room.status = "playing";
     room.startedAt = Date.now();
     room.firstZombieDone = false;
@@ -260,12 +335,48 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       player.survivedMs = 0;
       player.rank = 0;
     }
-    if (room.mode === "tag") assignInitialTagger(room);
+    if (room.mode === "tag") setupTagRoom(room);
     if (room.mode === "battle_royale") setupBattleRoyale(room);
     broadcastRoom(room, "game_starting", { countdown: 3, room: serializeRoom(room) });
     if (room.mode === "zombie") room.forceZombieTimer = setTimeout(() => forceFirstZombie(room), FIRST_ZOMBIE_DELAY_MS);
-    if (room.mode === "tag") room.finishTimer = setTimeout(() => finishTagRoom(room, "time_up"), TAG_ROUND_MS);
+    if (room.mode === "tag") {
+      const activeAt = room.tagActiveAt || room.startedAt;
+      room.finishTimer = setTimeout(() => finishTagRoom(room, "time_up"), Math.max(1, activeAt + TAG_ROUND_MS - Date.now()));
+    }
     room.syncTimer = setInterval(() => syncPositions(room), POSITION_SYNC_MS);
+  }
+
+  function updateFullRoomAutoStart(room) {
+    if (!room || room.status !== "waiting") return;
+    const full = room.players.size >= room.maxPlayers;
+    if (!full) {
+      clearFullRoomAutoStart(room);
+      broadcastRoom(room, "room_updated", serializeRoom(room));
+      return;
+    }
+    if (room.autoStartTimer) return;
+    room.autoStartAt = Date.now() + 5_000;
+    broadcastRoom(room, "room_updated", serializeRoom(room));
+    room.autoStartTimer = setTimeout(() => {
+      room.autoStartTimer = null;
+      if (!rooms.has(room.code)) return;
+      if (room.status !== "waiting") return;
+      if (room.players.size < room.maxPlayers) {
+        room.autoStartAt = 0;
+        broadcastRoom(room, "room_updated", serializeRoom(room));
+        return;
+      }
+      startRoom(room);
+    }, 5_000);
+  }
+
+  function clearFullRoomAutoStart(room) {
+    if (!room) return;
+    if (room.autoStartTimer) {
+      clearTimeout(room.autoStartTimer);
+      room.autoStartTimer = null;
+    }
+    room.autoStartAt = 0;
   }
 
   function updatePosition(client, data = {}) {
@@ -283,6 +394,12 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     player.shield = Boolean(data.shield);
     player.updatedAt = now;
     player.positionInitialized = true;
+    if (room.mode === "tag" && player.status === "jailed") {
+      player.x = TAG_PRISON.x;
+      player.y = TAG_PRISON.y;
+      player.vx = 0;
+      player.vy = 0;
+    }
     serverCheckInfections(room);
     serverCheckTags(room);
     serverCheckBattleRoyale(room);
@@ -305,18 +422,90 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     const room = getClientRoom(client);
     if (!room || room.status !== "playing" || room.mode !== "tag") return;
     const now = Date.now();
-    if (now > room.startedAt + TAG_ROUND_MS) return;
+    if (now < (room.tagActiveAt || room.startedAt)) return;
+    if (now > (room.tagActiveAt || room.startedAt) + TAG_ROUND_MS) return;
     const tagger = room.players.get(client.userId);
-    if (!tagger || tagger.role !== "tagger") return;
+    if (!tagger || tagger.role !== "tagger" || tagger.status !== "tagger") return;
     if ((tagger.nextTagAllowedUntil || 0) > now) return;
     if (!hasFreshPosition(tagger, now)) return;
     const targetId = String(data.target_user_id || data.user_id || "");
     if (!targetId) return;
     const target = room.players.get(targetId);
-    if (!target || target.role === "tagger") return;
+    if (!target || target.role !== "runner" || target.status !== "runner") return;
     if (!hasFreshPosition(target, now)) return;
     if (distance(tagger, target) > TOUCH_RADIUS * 1.45) return;
     tagPlayer(room, tagger, target, "client_touch");
+  }
+
+  function requestTagAbility(client) {
+    const room = getClientRoom(client);
+    if (!room || room.status !== "playing" || room.mode !== "tag") return;
+    const player = room.players.get(client.userId);
+    if (!player) return;
+    const now = Date.now();
+    if (now < (room.tagActiveAt || room.startedAt)) return;
+    if (player.role === "tagger" && player.status === "tagger") {
+      if ((player.tagBoostReadyAt || 0) > now) return;
+      player.tagBoostUntil = now + TAG_BOOST_MS;
+      player.tagBoostReadyAt = now + TAG_BOOST_COOLDOWN_MS;
+      broadcastRoom(room, "tag_event", { type: "boost", user_id: player.userId, nickname: player.nickname, room: serializeRoom(room) });
+    } else if (player.role === "runner" && player.status === "runner") {
+      if ((player.runnerDashReadyAt || 0) > now) return;
+      player.runnerDashUntil = now + TAG_DASH_MS;
+      player.runnerDashReadyAt = now + TAG_DASH_COOLDOWN_MS;
+      broadcastRoom(room, "tag_event", { type: "dash", user_id: player.userId, nickname: player.nickname, room: serializeRoom(room) });
+    }
+  }
+
+  function requestTagItemSelect(client, data = {}) {
+    const room = getClientRoom(client);
+    if (!room || room.status !== "playing" || room.mode !== "tag" || room.tagVariant !== "item") return;
+    const player = room.players.get(client.userId);
+    if (!player || player.tagItem) return;
+    const now = Date.now();
+    if (now > (room.tagItemSelectUntil || 0)) return;
+    const itemId = String(data.item_id || data.item || "").trim();
+    if (!isValidTagItemForRole(player.role, itemId)) return;
+    player.tagItem = itemId;
+    broadcastRoom(room, "tag_event", { type: "item_selected", user_id: player.userId, item_id: itemId, room: serializeRoom(room) });
+  }
+
+  function requestTagItemUse(client) {
+    const room = getClientRoom(client);
+    if (!room || room.status !== "playing" || room.mode !== "tag" || room.tagVariant !== "item") return;
+    ensureTagItemRoundActive(room, Date.now());
+    const player = room.players.get(client.userId);
+    if (!player || player.status === "jailed") return;
+    const now = Date.now();
+    if (now < (room.tagActiveAt || room.startedAt)) return;
+    const itemId = String(player.tagItem || "");
+    if (!itemId || itemId === "hunter_radar") return;
+    if ((player.tagItemReadyAt || 0) > now) return;
+    if (!isValidTagItemForRole(player.role, itemId)) return;
+    if (itemId === "hunter_missile") {
+      const target = nearestActiveRunner(room, player, now);
+      if (!target) return;
+      player.tagItemReadyAt = now + (TAG_ITEM_COOLDOWNS[itemId] || 12_000);
+      target.tagSlowUntil = now + TAG_MISSILE_SLOW_MS;
+      broadcastRoom(room, "tag_event", { type: "item_effect", item_id: itemId, user_id: player.userId, target_user_id: target.userId, until: target.tagSlowUntil, room: serializeRoom(room) });
+    } else if (itemId === "prison_sentinel") {
+      player.tagItemReadyAt = now + (TAG_ITEM_COOLDOWNS[itemId] || 12_000);
+      room.prisonSentinel = { ownerId: player.userId, until: now + TAG_SENTINEL_MS };
+      broadcastRoom(room, "tag_event", { type: "item_effect", item_id: itemId, user_id: player.userId, until: room.prisonSentinel.until, room: serializeRoom(room) });
+    } else if (itemId === "runner_clone") {
+      player.tagItemReadyAt = now + (TAG_ITEM_COOLDOWNS[itemId] || 12_000);
+      player.cloneUntil = now + TAG_CLONE_MS;
+      broadcastRoom(room, "tag_event", { type: "item_effect", item_id: itemId, user_id: player.userId, until: player.cloneUntil, room: serializeRoom(room) });
+    } else if (itemId === "runner_speed_points") {
+      player.tagItemReadyAt = now + (TAG_ITEM_COOLDOWNS[itemId] || 12_000);
+      player.runnerSpeedUntil = now + TAG_SPEED_ITEM_MS;
+      player.runnerSpeedStacks = Math.min(3, (player.runnerSpeedStacks || 0) + 1);
+      broadcastRoom(room, "tag_event", { type: "item_effect", item_id: itemId, user_id: player.userId, until: player.runnerSpeedUntil, room: serializeRoom(room) });
+    } else if (itemId === "runner_smoke") {
+      player.tagItemReadyAt = now + (TAG_ITEM_COOLDOWNS[itemId] || 12_000);
+      player.smokeUntil = now + TAG_SMOKE_MS;
+      broadcastRoom(room, "tag_event", { type: "item_effect", item_id: itemId, user_id: player.userId, until: player.smokeUntil, room: serializeRoom(room) });
+    }
   }
 
   function requestBattleRoyaleDamage(client, data = {}) {
@@ -349,69 +538,166 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
   function serverCheckTags(room) {
     if (room.mode !== "tag") return;
     const now = Date.now();
-    if (now > room.startedAt + TAG_ROUND_MS) return;
-    const tagger = [...room.players.values()].find((player) => player.role === "tagger");
-    if (!tagger) {
-      assignInitialTagger(room);
-      return;
-    }
-    if ((tagger.nextTagAllowedUntil || 0) > now || !hasFreshPosition(tagger, now)) return;
-    const runners = [...room.players.values()].filter((player) => player.role !== "tagger");
-    for (const runner of runners) {
-      if (!hasFreshPosition(runner, now)) continue;
-      if (distance(tagger, runner) <= TOUCH_RADIUS) {
-        tagPlayer(room, tagger, runner, "contact");
-        return;
+    if (now < (room.tagActiveAt || room.startedAt)) return;
+    if (now > (room.tagActiveAt || room.startedAt) + TAG_ROUND_MS) return;
+    const taggers = [...room.players.values()].filter((player) => player.role === "tagger" && player.status === "tagger");
+    for (const tagger of taggers) {
+      if ((tagger.nextTagAllowedUntil || 0) > now || !hasFreshPosition(tagger, now)) continue;
+      const runners = [...room.players.values()].filter((player) => player.role === "runner" && player.status === "runner");
+      for (const runner of runners) {
+        if (!hasFreshPosition(runner, now)) continue;
+        if ((runner.tagImmuneUntil || 0) > now) continue;
+        if (distance(tagger, runner) <= TOUCH_RADIUS) {
+          tagPlayer(room, tagger, runner, "contact");
+          return;
+        }
       }
     }
+    updateTagRescue(room, now);
+    checkTagWin(room, "contact");
   }
 
-  function assignInitialTagger(room) {
+  function setupTagRoom(room) {
     const players = [...room.players.values()];
     if (players.length === 0) return;
     const now = Date.now();
+    const taggerCount = Math.min(TAG_TAGGER_COUNT, Math.max(1, players.length - 1));
     for (const player of players) {
       player.status = "runner";
       player.role = "runner";
       player.tagImmuneUntil = now + TAG_IMMUNITY_MS;
       player.nextTagAllowedUntil = 0;
+      player.tagBoostUntil = 0;
+      player.tagBoostReadyAt = now + 1_500;
+      player.runnerDashUntil = 0;
+      player.runnerDashReadyAt = now + 2_000;
+      player.tagItem = "";
+      player.tagItemReadyAt = 0;
+      player.tagSlowUntil = 0;
+      player.cloneUntil = 0;
+      player.runnerSpeedUntil = 0;
+      player.runnerSpeedStacks = 0;
+      player.smokeUntil = 0;
+      player.jailedAt = 0;
+      player.rescuedCount = 0;
+      player.x = TAG_PRISON.x + 250 + Math.cos(players.indexOf(player)) * 180;
+      player.y = TAG_PRISON.y + Math.sin(players.indexOf(player)) * 180;
+      player.positionInitialized = true;
     }
-    const tagger = players[Math.floor(Math.random() * players.length)];
-    tagger.status = "tagger";
-    tagger.role = "tagger";
-    tagger.tagImmuneUntil = 0;
-    tagger.nextTagAllowedUntil = now + TAG_IMMUNITY_MS;
-    console.info(`[tag] start room=${room.code} tagger=${tagger.userId}`);
+    const shuffled = players.slice().sort(() => Math.random() - 0.5);
+    for (let i = 0; i < taggerCount; i += 1) {
+      const tagger = shuffled[i];
+      tagger.status = "tagger";
+      tagger.role = "tagger";
+      tagger.tagImmuneUntil = 0;
+      tagger.nextTagAllowedUntil = now + TAG_IMMUNITY_MS;
+      tagger.x = TAG_PRISON.x - 320 - i * 85;
+      tagger.y = TAG_PRISON.y - 140 + i * 280;
+    }
+    if (room.tagVariant === "item") {
+      room.tagItemSelectUntil = now + TAG_ITEM_SELECT_MS;
+      room.tagActiveAt = room.tagItemSelectUntil;
+      room.tagItemRoundStarted = false;
+    } else {
+      room.tagItemSelectUntil = 0;
+      room.tagActiveAt = now;
+      room.tagItemRoundStarted = true;
+    }
+    room.tagRescue = { rescuerId: "", startedAt: 0, targetId: "" };
+    console.info(`[tag] start room=${room.code} taggers=${taggerCount}`);
     broadcastRoom(room, "tag_event", {
-      user_id: tagger.userId,
+      type: "start",
       by_user_id: "server",
-      reason: "initial",
-      nickname: tagger.nickname,
+      reason: room.tagVariant === "item" ? "item_select" : "initial",
       room: serializeRoom(room),
     });
   }
 
+  function ensureTagItemRoundActive(room, now) {
+    if (!room || room.mode !== "tag" || room.tagVariant !== "item") return;
+    if (room.tagItemRoundStarted || now < (room.tagActiveAt || 0)) return;
+    for (const player of room.players.values()) {
+      if (!player.tagItem) {
+        player.tagItem = player.role === "tagger" ? TAG_ITEM_DEFAULTS.tagger : TAG_ITEM_DEFAULTS.runner;
+      }
+    }
+    room.tagItemRoundStarted = true;
+    broadcastRoom(room, "tag_event", { type: "round_started", room: serializeRoom(room) });
+  }
+
   function tagPlayer(room, tagger, target, reason) {
     const now = Date.now();
-    if (!tagger || !target || tagger.role !== "tagger" || target.role === "tagger") return;
+    if (!tagger || !target || tagger.role !== "tagger" || target.role !== "runner") return;
     if ((target.tagImmuneUntil || 0) > now) return;
-    tagger.role = "runner";
-    tagger.status = "runner";
-    tagger.tagImmuneUntil = now + TAG_IMMUNITY_MS;
-    target.role = "tagger";
-    target.status = "tagger";
-    target.tagImmuneUntil = 0;
-    target.nextTagAllowedUntil = now + TAG_IMMUNITY_MS;
+    target.status = "jailed";
+    target.role = "jailed";
+    target.x = TAG_PRISON.x;
+    target.y = TAG_PRISON.y;
+    target.vx = 0;
+    target.vy = 0;
+    target.jailedAt = now;
+    target.survivedMs = Math.max(target.survivedMs || 0, now - (room.tagActiveAt || room.startedAt));
     tagger.nextTagAllowedUntil = now + TAG_TOUCH_COOLDOWN_MS;
     tagger.tagCount = (tagger.tagCount || 0) + 1;
-    target.survivedMs = Math.max(target.survivedMs || 0, now - room.startedAt);
     broadcastRoom(room, "tag_event", {
+      type: "jailed",
       user_id: target.userId,
       by_user_id: tagger.userId,
       reason,
       nickname: target.nickname,
       room: serializeRoom(room),
     });
+    checkTagWin(room, "caught");
+  }
+
+  function updateTagRescue(room, now) {
+    if (!room || room.mode !== "tag" || room.status !== "playing") return;
+    if (now < (room.tagActiveAt || room.startedAt)) return;
+    const jailed = [...room.players.values()].filter((player) => player.status === "jailed");
+    if (jailed.length === 0) {
+      room.tagRescue = { rescuerId: "", startedAt: 0, targetId: "" };
+      return;
+    }
+    const rescuers = [...room.players.values()].filter((player) =>
+      player.status === "runner" &&
+      distancePoint(player, TAG_PRISON) <= TAG_RESCUE_RADIUS &&
+      hasFreshPosition(player, now)
+    );
+    if (rescuers.length === 0) {
+      room.tagRescue = { rescuerId: "", startedAt: 0, targetId: "" };
+      return;
+    }
+    const rescuer = rescuers[0];
+    if (room.prisonSentinel && (room.prisonSentinel.until || 0) > now) {
+      rescuer.tagSlowUntil = Math.max(rescuer.tagSlowUntil || 0, now + 700);
+      return;
+    }
+    const target = jailed.sort((a, b) => (a.jailedAt || 0) - (b.jailedAt || 0))[0];
+    if (!room.tagRescue || room.tagRescue.rescuerId !== rescuer.userId || room.tagRescue.targetId !== target.userId) {
+      room.tagRescue = { rescuerId: rescuer.userId, targetId: target.userId, startedAt: now };
+    }
+    if (now - room.tagRescue.startedAt < TAG_RESCUE_MS) return;
+    target.status = "runner";
+    target.role = "runner";
+    target.tagImmuneUntil = now + 2_000;
+    target.x = TAG_PRISON.x + 150;
+    target.y = TAG_PRISON.y;
+    target.positionInitialized = true;
+    rescuer.rescuedCount = (rescuer.rescuedCount || 0) + 1;
+    room.tagRescue = { rescuerId: "", startedAt: 0, targetId: "" };
+    broadcastRoom(room, "tag_event", {
+      type: "rescued",
+      user_id: target.userId,
+      by_user_id: rescuer.userId,
+      nickname: target.nickname,
+      room: serializeRoom(room),
+    });
+  }
+
+  function checkTagWin(room, reason) {
+    if (!room || room.status !== "playing" || room.mode !== "tag") return;
+    const aliveRunners = [...room.players.values()].filter((player) => player.status === "runner").length;
+    if (aliveRunners <= 0) finishTagRoom(room, reason || "taggers_win");
   }
 
   function setupBattleRoyale(room) {
@@ -556,11 +842,21 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     clearInterval(room.syncTimer);
     const now = Date.now();
     const players = [...room.players.values()];
+    const aliveRunners = players.filter((player) => player.status === "runner").length;
+    const runnerTeamWon = reason === "time_up" && aliveRunners >= TAG_RUNNER_WIN_SURVIVORS;
     for (const player of players) {
-      player.survivedMs = Math.max(player.survivedMs || 0, now - room.startedAt);
-      player.score = Math.floor((player.survivedMs || 0) / 1000) + (player.tagCount || 0) * 120 + (player.role === "tagger" ? -25 : 25);
+      player.survivedMs = Math.max(player.survivedMs || 0, now - (room.tagActiveAt || room.startedAt));
+      player.isWinner = runnerTeamWon ? player.status === "runner" : player.status === "tagger";
+      player.score = Math.floor((player.survivedMs || 0) / 1000)
+        + (player.tagCount || 0) * 120
+        + (player.rescuedCount || 0) * 90
+        + (player.isWinner ? 500 : 0);
     }
-    players.sort((a, b) => (b.score || 0) - (a.score || 0));
+    players.sort((a, b) => {
+      if (a.isWinner && !b.isWinner) return -1;
+      if (!a.isWinner && b.isWinner) return 1;
+      return (b.score || 0) - (a.score || 0);
+    });
     players.forEach((player, index) => {
       player.rank = index + 1;
       player.coins = tagCoinsForRank(player.rank, reason, Math.max(0, now - room.startedAt));
@@ -577,7 +873,9 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     broadcastRoom(room, "game_result", {
       mode: "tag",
       reason,
-      winner_user_ids: players.length > 0 ? [players[0].userId] : [],
+      winner_team: runnerTeamWon ? "runners" : "taggers",
+      alive_runners: aliveRunners,
+      winner_user_ids: players.filter((player) => player.isWinner).map((player) => player.userId),
       players: players.map(tagResultPayload),
     });
   }
@@ -728,11 +1026,23 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
 
   function syncPositions(room) {
     if (room.status !== "playing") return;
-    const elapsed = Date.now() - room.startedAt;
+    const now = Date.now();
+    if (room.mode === "tag") ensureTagItemRoundActive(room, now);
+    const activeAt = room.mode === "tag" ? (room.tagActiveAt || room.startedAt) : room.startedAt;
+    const elapsed = now - activeAt;
     broadcastRoom(room, "positions_sync", {
       mode: room.mode,
       elapsed_ms: elapsed,
-      round_ends_at: room.mode === "tag" ? room.startedAt + TAG_ROUND_MS : 0,
+      tag_variant: room.mode === "tag" ? (room.tagVariant || "basic") : "",
+      tag_item_select_until: room.mode === "tag" ? (room.tagItemSelectUntil || 0) : 0,
+      tag_active_at: room.mode === "tag" ? activeAt : 0,
+      tag_prison_sentinel: room.mode === "tag" ? (room.prisonSentinel || {}) : {},
+      round_ends_at: room.mode === "tag" ? activeAt + TAG_ROUND_MS : 0,
+      tag_prison: room.mode === "tag" ? TAG_PRISON : null,
+      tag_prison_radius: room.mode === "tag" ? TAG_PRISON_RADIUS : 0,
+      tag_rescue_radius: room.mode === "tag" ? TAG_RESCUE_RADIUS : 0,
+      tag_rescue_required_ms: room.mode === "tag" ? TAG_RESCUE_MS : 0,
+      tag_rescue: room.mode === "tag" ? (room.tagRescue || {}) : {},
       zone_radius: room.mode === "battle_royale" ? battleRoyaleZone(room, Date.now()).radius : 0,
       zone_damage_per_sec: room.mode === "battle_royale" ? battleRoyaleZone(room, Date.now()).damage : 0,
       zombie_speed_multiplier: zombieSpeedMultiplier(elapsed),
@@ -750,17 +1060,35 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
         shield: player.shield,
         tag_count: player.tagCount || 0,
         tag_immune_until: player.tagImmuneUntil || 0,
+        rescued_count: player.rescuedCount || 0,
+        tag_boost_until: player.tagBoostUntil || 0,
+        tag_boost_ready_at: player.tagBoostReadyAt || 0,
+        runner_dash_until: player.runnerDashUntil || 0,
+        runner_dash_ready_at: player.runnerDashReadyAt || 0,
+        tag_item: player.tagItem || "",
+        tag_item_ready_at: player.tagItemReadyAt || 0,
+        tag_slow_until: player.tagSlowUntil || 0,
+        clone_until: player.cloneUntil || 0,
+        runner_speed_until: player.runnerSpeedUntil || 0,
+        runner_speed_stacks: player.runnerSpeedStacks || 0,
+        smoke_until: player.smokeUntil || 0,
+        jailed_at: player.jailedAt || 0,
       })),
     });
+    if (room.mode === "tag") {
+      updateTagRescue(room, now);
+      if (now >= activeAt + TAG_ROUND_MS) finishTagRoom(room, "time_up");
+    }
   }
 
-  function makeRoom(mode, hostClient, maxPlayers, quick) {
+  function makeRoom(mode, hostClient, maxPlayers, quick, tagVariant = "basic") {
     let code = makeRoomCode();
     while (rooms.has(code)) code = makeRoomCode();
     const room = {
       code,
       dbId: null,
       mode,
+      tagVariant: normalizeTagVariant(tagVariant),
       hostId: hostClient.userId,
       hostNickname: hostClient.nickname,
       maxPlayers,
@@ -776,6 +1104,12 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       syncTimer: null,
       forceZombieTimer: null,
       finishTimer: null,
+      autoStartTimer: null,
+      autoStartAt: 0,
+      tagItemSelectUntil: 0,
+      tagActiveAt: 0,
+      tagItemRoundStarted: false,
+      prisonSentinel: {},
     };
     rooms.set(code, room);
     return room;
@@ -823,6 +1157,19 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       tagCount: 0,
       tagImmuneUntil: 0,
       nextTagAllowedUntil: 0,
+      rescuedCount: 0,
+      tagBoostUntil: 0,
+      tagBoostReadyAt: 0,
+      runnerDashUntil: 0,
+      runnerDashReadyAt: 0,
+      tagItem: "",
+      tagItemReadyAt: 0,
+      tagSlowUntil: 0,
+      cloneUntil: 0,
+      runnerSpeedUntil: 0,
+      runnerSpeedStacks: 0,
+      smokeUntil: 0,
+      jailedAt: 0,
       rank: 0,
       hp: BR_INITIAL_HP,
       eliminatedAt: 0,
@@ -837,10 +1184,10 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     if (!room) return;
     const wasHost = room.hostId === client.userId;
     const leavingPlayer = room.players.get(client.userId);
-    const wasTagger = room.mode === "tag" && leavingPlayer && leavingPlayer.role === "tagger";
     room.players.delete(client.userId);
     client.roomCode = "";
     if (room.players.size === 0) {
+      clearFullRoomAutoStart(room);
       clearTimeout(room.forceZombieTimer);
       clearTimeout(room.finishTimer);
       clearInterval(room.syncTimer);
@@ -856,8 +1203,9 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
         }
       }
       broadcastRoom(room, "room_updated", serializeRoom(room));
+      updateFullRoomAutoStart(room);
       if (room.status === "playing" && room.mode === "tag" && room.players.size < 2) finishTagRoom(room, "player_left");
-      else if (room.status === "playing" && room.mode === "tag" && wasTagger) assignInitialTagger(room);
+      else if (room.status === "playing" && room.mode === "tag") checkTagWin(room, "player_left");
       else if (room.status === "playing" && room.mode === "battle_royale") {
         const survivors = [...room.players.values()].filter((item) => item.status === "alive");
         if (survivors.length <= 1) finishBattleRoyaleRoom(room, survivors, "player_left");
@@ -867,7 +1215,10 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
 
   function disconnectClient(client) {
     const current = clientsByUserId.get(client.userId);
-    if (current === client) clientsByUserId.delete(client.userId);
+    if (current === client) {
+      clientsByUserId.delete(client.userId);
+      onlineUserIds.delete(client.userId);
+    }
     leaveQuickMatch(client, false);
     removeFromCurrentRoom(client);
   }
@@ -889,11 +1240,16 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       code: room.code,
       room_code: room.code,
       mode: room.mode,
+      tag_variant: room.tagVariant || "basic",
       host_id: room.hostId,
       status: room.status,
       max_players: room.maxPlayers,
       private: Boolean(room.private),
+      auto_start_at: room.autoStartAt || 0,
       settings: room.settings || {},
+      tag_item_select_until: room.tagItemSelectUntil || 0,
+      tag_active_at: room.tagActiveAt || 0,
+      tag_prison_sentinel: room.prisonSentinel || {},
       players: [...room.players.values()].map((player) => ({
         user_id: player.userId,
         nickname: player.nickname,
@@ -907,6 +1263,19 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
         tag_count: player.tagCount || 0,
         tag_immune_until: player.tagImmuneUntil || 0,
         next_tag_allowed_until: player.nextTagAllowedUntil || 0,
+        rescued_count: player.rescuedCount || 0,
+        tag_boost_until: player.tagBoostUntil || 0,
+        tag_boost_ready_at: player.tagBoostReadyAt || 0,
+        runner_dash_until: player.runnerDashUntil || 0,
+        runner_dash_ready_at: player.runnerDashReadyAt || 0,
+        tag_item: player.tagItem || "",
+        tag_item_ready_at: player.tagItemReadyAt || 0,
+        tag_slow_until: player.tagSlowUntil || 0,
+        clone_until: player.cloneUntil || 0,
+        runner_speed_until: player.runnerSpeedUntil || 0,
+        runner_speed_stacks: player.runnerSpeedStacks || 0,
+        smoke_until: player.smokeUntil || 0,
+        jailed_at: player.jailedAt || 0,
         x: player.x,
         y: player.y,
         shield: player.shield,
@@ -935,7 +1304,10 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       score: Math.max(0, player.score || 0),
       survived_ms: player.survivedMs,
       tag_count: player.tagCount || 0,
-      is_winner: player.rank === 1,
+      rescued_count: player.rescuedCount || 0,
+      role: player.role,
+      status: player.status,
+      is_winner: Boolean(player.isWinner),
       coins,
     };
   }
@@ -1009,6 +1381,15 @@ function normalizeMultiplayerMode(value) {
   return mode === "battle_royale" ? "battle_royale" : "zombie";
 }
 
+function normalizeTagVariant(value) {
+  return String(value || "basic").trim().toLowerCase() === "item" ? "item" : "basic";
+}
+
+function quickMatchKey(mode, tagVariant = "basic") {
+  const normalized = normalizeMultiplayerMode(mode);
+  return normalized === "tag" ? `${normalized}:${normalizeTagVariant(tagVariant)}` : normalized;
+}
+
 function quickMatchSizeForMode(mode) {
   return maxPlayersForMode(mode);
 }
@@ -1025,7 +1406,30 @@ function cleanRoomSettings(value) {
   return {
     shield_enabled: input.shield_enabled !== false,
     laser_speed: String(input.laser_speed || "기본").slice(0, 16),
+    tag_variant: normalizeTagVariant(input.tag_variant),
   };
+}
+
+function isValidTagItemForRole(role, itemId) {
+  if (role === "tagger") return TAG_HUNTER_ITEMS.has(itemId);
+  if (role === "runner") return TAG_RUNNER_ITEMS.has(itemId);
+  return false;
+}
+
+function nearestActiveRunner(room, source, now) {
+  let best = null;
+  let bestDist = Number.POSITIVE_INFINITY;
+  for (const player of room.players.values()) {
+    if (player.role !== "runner" || player.status !== "runner") continue;
+    if ((player.smokeUntil || 0) > now) continue;
+    if (!hasFreshPosition(player, now)) continue;
+    const d = distance(source, player);
+    if (d < bestDist) {
+      bestDist = d;
+      best = player;
+    }
+  }
+  return best;
 }
 
 function distance(a, b) {
