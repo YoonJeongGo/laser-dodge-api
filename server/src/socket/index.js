@@ -40,7 +40,7 @@ const TAG_ITEM_COOLDOWNS = {
   runner_smoke: 16_000,
 };
 const TAG_MISSILE_SLOW_MS = 2_500;
-const TAG_SENTINEL_MS = 18_000;
+const TAG_SENTINEL_MS = 10_000;
 const TAG_CLONE_MS = 5_000;
 const TAG_SPEED_ITEM_MS = 6_000;
 const TAG_SMOKE_MS = 4_000;
@@ -391,6 +391,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     for (const player of room.players.values()) {
       player.status = "alive";
       player.role = "survivor";
+      player.tagTeam = "";
       player.infectedCount = 0;
       player.zombieMissileCharge = 0;
       player.zombieSlowUntil = 0;
@@ -744,6 +745,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       const spawn = runnerSpawns[players.indexOf(player) % runnerSpawns.length];
       player.status = "runner";
       player.role = "runner";
+      player.tagTeam = "runner";
       player.tagImmuneUntil = now + TAG_IMMUNITY_MS;
       player.nextTagAllowedUntil = 0;
       player.tagBoostUntil = 0;
@@ -768,6 +770,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       const tagger = shuffled[i];
       tagger.status = "tagger";
       tagger.role = "tagger";
+      tagger.tagTeam = "tagger";
       tagger.tagImmuneUntil = 0;
       tagger.nextTagAllowedUntil = now + TAG_IMMUNITY_MS;
       const spawn = taggerSpawns[i % taggerSpawns.length];
@@ -1438,9 +1441,12 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     const players = [...room.players.values()];
     const aliveRunners = players.filter((player) => player.status === "runner").length;
     const runnerTeamWon = reason === "time_up" && aliveRunners >= TAG_RUNNER_WIN_SURVIVORS;
+    const winnerTeam = runnerTeamWon ? "runner" : "tagger";
     for (const player of players) {
       player.survivedMs = Math.max(player.survivedMs || 0, now - (room.tagActiveAt || room.startedAt));
-      player.isWinner = runnerTeamWon ? player.status === "runner" : player.status === "tagger";
+      const team = player.tagTeam || (player.role === "tagger" || player.status === "tagger" ? "tagger" : "runner");
+      player.tagTeam = team;
+      player.isWinner = team === winnerTeam;
       player.score = Math.floor((player.survivedMs || 0) / 1000)
         + (player.tagCount || 0) * 120
         + (player.rescuedCount || 0) * 90
@@ -1449,11 +1455,13 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     players.sort((a, b) => {
       if (a.isWinner && !b.isWinner) return -1;
       if (!a.isWinner && b.isWinner) return 1;
+      if ((a.tagTeam || "") === "tagger" && (b.tagTeam || "") !== "tagger") return winnerTeam === "tagger" ? -1 : 1;
+      if ((a.tagTeam || "") !== "tagger" && (b.tagTeam || "") === "tagger") return winnerTeam === "tagger" ? 1 : -1;
       return (b.score || 0) - (a.score || 0);
     });
     players.forEach((player, index) => {
       player.rank = index + 1;
-      player.coins = tagCoinsForRank(player.rank, reason, Math.max(0, now - room.startedAt));
+      player.coins = tagCoinsForTeamResult(player, reason, Math.max(0, now - room.startedAt));
       saveTagResult(room, { ...player }, reason).catch((error) => {
         console.error("[tag] save result failed", {
           room: room.code,
@@ -1553,6 +1561,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     player.isHost = player.userId === room.hostId;
     player.status = "alive";
     player.role = "survivor";
+    player.tagTeam = "";
     player.x = 195;
     player.y = 422;
     player.vx = 0;
@@ -1753,6 +1762,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
         facing_angle: player.facingAngle || 0,
         status: player.status,
         role: player.role,
+        tag_team: player.tagTeam || "",
         hp: room.mode === "battle_royale" ? (Number.isFinite(player.hp) ? player.hp : BR_INITIAL_HP) : (player.hp || 0),
         rank: player.rank || 0,
         shield: player.shield,
@@ -1861,6 +1871,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       isHost,
       status: "alive",
       role: "survivor",
+      tagTeam: "",
       x: 195,
       y: 422,
       vx: 0,
@@ -1989,6 +2000,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
         in_lobby: player.returnedToLobby !== false,
         status: player.status,
         role: player.role,
+        tag_team: player.tagTeam || "",
         hp: room.mode === "battle_royale" ? (Number.isFinite(player.hp) ? player.hp : BR_INITIAL_HP) : (player.hp || 0),
         rank: player.rank || 0,
         shield: player.shield,
@@ -2045,6 +2057,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       rescued_count: player.rescuedCount || 0,
       role: player.role,
       status: player.status,
+      tag_team: player.tagTeam || (player.role === "tagger" || player.status === "tagger" ? "tagger" : "runner"),
       is_winner: Boolean(player.isWinner),
       coins,
     };
@@ -2255,6 +2268,13 @@ function tagCoinsForRank(rank, reason = "time_up", elapsedMs = TAG_ROUND_MS) {
   if (rank === 2) return 18;
   if (rank === 3) return 12;
   return 8;
+}
+
+function tagCoinsForTeamResult(player, reason = "time_up", elapsedMs = TAG_ROUND_MS) {
+  if (reason !== "time_up" && elapsedMs < PLAYER_LEFT_REWARD_MIN_MS) return 0;
+  const team = player.tagTeam || (player.role === "tagger" || player.status === "tagger" ? "tagger" : "runner");
+  if (player.isWinner) return team === "tagger" ? 30 : 20;
+  return team === "tagger" ? 8 : 5;
 }
 
 function battleRoyaleCoinsForRank(rank, reason = "last_survivor", elapsedMs = BR_ZONE_SHRINK_MS) {
