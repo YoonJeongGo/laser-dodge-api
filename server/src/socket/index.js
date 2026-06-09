@@ -363,6 +363,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       player.survivedMs = 0;
       player.rank = 0;
     }
+    if (room.mode === "zombie") setupZombieRoom(room);
     if (room.mode === "tag") setupTagRoom(room);
     if (room.mode === "battle_royale") setupBattleRoyale(room);
     broadcastRoom(room, "game_starting", { countdown: 3, room: serializeRoom(room) });
@@ -691,6 +692,32 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       reason: room.tagVariant === "item" ? "item_select" : "initial",
       room: serializeRoom(room),
     });
+  }
+
+  function setupZombieRoom(room) {
+    const spawns = [
+      { x: -360, y: -260 },
+      { x: 360, y: -260 },
+      { x: -360, y: 260 },
+      { x: 360, y: 260 },
+      { x: 0, y: -420 },
+      { x: 0, y: 420 },
+    ];
+    let index = 0;
+    for (const player of room.players.values()) {
+      const spawn = spawns[index % spawns.length];
+      player.x = spawn.x;
+      player.y = spawn.y;
+      player.vx = 0;
+      player.vy = 0;
+      player.status = "alive";
+      player.role = "survivor";
+      player.infectedCount = 0;
+      player.survivedMs = 0;
+      player.rank = 0;
+      player.positionInitialized = true;
+      index += 1;
+    }
   }
 
   function ensureTagItemRoundActive(room, now) {
