@@ -464,6 +464,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     player.vx = Number(data.vx) || 0;
     player.vy = Number(data.vy) || 0;
     player.shield = Boolean(data.shield);
+    player.skinId = cleanCosmeticId(data.skin_id || data.skinId || player.skinId || "skin_default");
     player.updatedAt = now;
     player.positionInitialized = true;
     if (room.mode === "tag" && player.status === "jailed") clampPlayerToTagPrison(player);
@@ -1231,6 +1232,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
         hp: player.hp || 0,
         rank: player.rank || 0,
         shield: player.shield,
+        skin_id: player.skinId || "skin_default",
         tag_count: player.tagCount || 0,
         tag_immune_until: player.tagImmuneUntil || 0,
         rescued_count: player.rescuedCount || 0,
@@ -1326,6 +1328,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       vx: 0,
       vy: 0,
       shield: false,
+      skinId: "skin_default",
       survivedMs: 0,
       infectedCount: 0,
       tagCount: 0,
@@ -1455,6 +1458,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
         x: player.x,
         y: player.y,
         shield: player.shield,
+        skin_id: player.skinId || "skin_default",
       })),
     };
   }
@@ -1558,7 +1562,12 @@ function normalizeMultiplayerMode(value) {
 }
 
 function normalizeTagVariant(value) {
-  return String(value || "basic").trim().toLowerCase() === "item" ? "item" : "basic";
+ return String(value || "basic").trim().toLowerCase() === "item" ? "item" : "basic";
+}
+
+function cleanCosmeticId(value) {
+  const id = String(value || "skin_default").trim();
+  return /^[a-z0-9_:-]{1,48}$/i.test(id) ? id : "skin_default";
 }
 
 function quickMatchKey(mode, tagVariant = "basic") {
