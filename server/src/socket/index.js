@@ -43,7 +43,7 @@ const POSITION_MAX_ABS = 200_000;
 const POSITION_MAX_SPEED = 1_600;
 const POSITION_GRACE_DISTANCE = 90;
 const PLAYER_LEFT_REWARD_MIN_MS = 30_000;
-const BR_INITIAL_HP = 3;
+const BR_INITIAL_HP = 4;
 const BR_INITIAL_ZONE_RADIUS = 1800;
 const BR_FINAL_ZONE_RADIUS = 260;
 const BR_ZONE_SHRINK_MS = 120_000;
@@ -96,6 +96,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     client.on("create_room", (data, ack) => createRoom(client, data, ack));
     client.on("join_room", (data, ack) => joinRoom(client, data, ack));
     client.on("leave_room", () => removeFromCurrentRoom(client));
+    client.on("kick_player", (data, ack) => kickPlayer(client, data, ack));
     client.on("invite_friend", (data, ack) => inviteFriend(client, data, ack));
     client.on("accept_invite", (data, ack) => acceptInvite(client, data, ack));
     client.on("player_ready", (data) => setReady(client, data));
@@ -325,7 +326,9 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     clearFullRoomAutoStart(room);
     room.status = "playing";
     room.startedAt = Date.now();
+    room.roundId = (room.roundId || 0) + 1;
     room.firstZombieDone = false;
+    room.resultFinalized = false;
     for (const player of room.players.values()) {
       player.status = "alive";
       player.role = "survivor";
@@ -377,6 +380,25 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       room.autoStartTimer = null;
     }
     room.autoStartAt = 0;
+  }
+
+  function kickPlayer(client, data = {}, ack = null) {
+    const room = getClientRoom(client);
+    if (!room) return sendRequestFailed(client, ack, "kick_player", "room_not_found");
+    if (room.hostId !== client.userId) return sendRequestFailed(client, ack, "kick_player", "not_host");
+    const targetId = String(data.user_id || data.target_user_id || "").trim();
+    if (!targetId || !room.players.has(targetId)) return sendRequestFailed(client, ack, "kick_player", "target_not_found");
+    if (targetId === client.userId) return sendRequestFailed(client, ack, "kick_player", "cannot_kick_self");
+    const targetClient = clientsByUserId.get(targetId);
+    if (targetClient) {
+      targetClient.send("kicked", { room_code: room.code, reason: "host_kick" });
+      removeFromCurrentRoom(targetClient);
+    } else {
+      room.players.delete(targetId);
+      broadcastRoom(room, "room_updated", serializeRoom(room));
+      updateFullRoomAutoStart(room);
+    }
+    sendAck(ack, { ok: true });
   }
 
   function updatePosition(client, data = {}) {
@@ -806,6 +828,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
   function finishRoom(room, survivors) {
     if (room.status === "finished") return;
     room.status = "finished";
+    room.resultFinalized = true;
     clearTimeout(room.forceZombieTimer);
     clearTimeout(room.finishTimer);
     clearInterval(room.syncTimer);
@@ -819,7 +842,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     players.forEach((player, index) => {
       player.rank = index + 1;
       player.survivedMs = Math.max(player.survivedMs || 0, Date.now() - room.startedAt);
-      saveZombieResult(room, player.userId, player).catch((error) => {
+      saveZombieResult(room, player.userId, { ...player }).catch((error) => {
         console.error("[zombie] save result failed", {
           room: room.code,
           userId: player.userId,
@@ -828,10 +851,12 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       });
     });
     broadcastRoom(room, "game_result", {
+      mode: "zombie",
       reason: winnerIds.length === 0 ? "zombie_team" : "last_survivor",
       winner_user_ids: winnerIds,
       players: players.map(resultPayload),
     });
+    returnRoomToLobby(room);
   }
 
   function finishTagRoom(room, reason) {
@@ -860,7 +885,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     players.forEach((player, index) => {
       player.rank = index + 1;
       player.coins = tagCoinsForRank(player.rank, reason, Math.max(0, now - room.startedAt));
-      saveTagResult(room, player, reason).catch((error) => {
+      saveTagResult(room, { ...player }, reason).catch((error) => {
         console.error("[tag] save result failed", {
           room: room.code,
           userId: player.userId,
@@ -878,6 +903,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       winner_user_ids: players.filter((player) => player.isWinner).map((player) => player.userId),
       players: players.map(tagResultPayload),
     });
+    returnRoomToLobby(room);
   }
 
   function finishBattleRoyaleRoom(room, survivors, reason) {
@@ -898,7 +924,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       player.survivedMs = Math.max(player.survivedMs || 0, elapsedMs);
       if (!player.rank) player.rank = players.length;
       player.coins = battleRoyaleCoinsForRank(player.rank, reason, elapsedMs);
-      saveBattleRoyaleResult(room, player).catch((error) => {
+      saveBattleRoyaleResult(room, { ...player }).catch((error) => {
         console.error("[br] save result failed", {
           room: room.code,
           userId: player.userId,
@@ -914,6 +940,66 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       winner_user_ids: survivors.map((player) => player.userId),
       players: players.map(battleRoyaleResultPayload),
     });
+    returnRoomToLobby(room);
+  }
+
+  function returnRoomToLobby(room) {
+    if (!room || !rooms.has(room.code)) return;
+    clearTimeout(room.forceZombieTimer);
+    clearTimeout(room.finishTimer);
+    clearInterval(room.syncTimer);
+    clearFullRoomAutoStart(room);
+    room.status = "waiting";
+    room.startedAt = 0;
+    room.firstZombieDone = false;
+    room.resultFinalized = false;
+    room.tagItemSelectUntil = 0;
+    room.tagActiveAt = 0;
+    room.tagItemRoundStarted = false;
+    room.prisonSentinel = {};
+    room.tagRescue = { rescuerId: "", startedAt: 0, targetId: "" };
+    for (const player of room.players.values()) resetPlayerForLobby(room, player);
+    broadcastRoom(room, "room_updated", serializeRoom(room));
+    updateFullRoomAutoStart(room);
+  }
+
+  function resetPlayerForLobby(room, player) {
+    player.ready = player.userId === room.hostId;
+    player.isHost = player.userId === room.hostId;
+    player.status = "alive";
+    player.role = "survivor";
+    player.x = 195;
+    player.y = 422;
+    player.vx = 0;
+    player.vy = 0;
+    player.shield = false;
+    player.survivedMs = 0;
+    player.infectedCount = 0;
+    player.tagCount = 0;
+    player.tagImmuneUntil = 0;
+    player.nextTagAllowedUntil = 0;
+    player.rescuedCount = 0;
+    player.tagBoostUntil = 0;
+    player.tagBoostReadyAt = 0;
+    player.runnerDashUntil = 0;
+    player.runnerDashReadyAt = 0;
+    player.tagItem = "";
+    player.tagItemReadyAt = 0;
+    player.tagSlowUntil = 0;
+    player.cloneUntil = 0;
+    player.runnerSpeedUntil = 0;
+    player.runnerSpeedStacks = 0;
+    player.smokeUntil = 0;
+    player.jailedAt = 0;
+    player.rank = 0;
+    player.hp = BR_INITIAL_HP;
+    player.eliminatedAt = 0;
+    player.lastZoneDamageAt = 0;
+    player.updatedAt = Date.now();
+    player.positionInitialized = false;
+    player.isWinner = false;
+    player.score = 0;
+    player.coins = 0;
   }
 
   async function saveZombieResult(room, userId, data = {}) {
@@ -923,7 +1009,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     const infectedCount = Math.max(0, Number.parseInt(data.infected_count ?? data.infectedCount, 10) || 0);
     const isWinner = Boolean(data.is_winner || rank === 1);
     const coins = isWinner ? 20 : 5;
-    const refId = `${room.code}:zombie:${userId}`;
+    const refId = `${room.code}:zombie:${room.roundId || 1}:${userId}`;
     const dbClient = await pool.connect();
     try {
       await dbClient.query("BEGIN");
@@ -958,7 +1044,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
   async function saveTagResult(room, player, reason = "time_up") {
     const elapsedMs = Math.max(0, Date.now() - room.startedAt);
     const coins = Number.isFinite(player.coins) ? player.coins : tagCoinsForRank(player.rank, reason, elapsedMs);
-    const refId = `${room.code}:tag:${player.userId}`;
+    const refId = `${room.code}:tag:${room.roundId || 1}:${player.userId}`;
     const dbClient = await pool.connect();
     try {
       await dbClient.query("BEGIN");
@@ -992,7 +1078,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
 
   async function saveBattleRoyaleResult(room, player) {
     const coins = Number.isFinite(player.coins) ? player.coins : battleRoyaleCoinsForRank(player.rank);
-    const refId = `${room.code}:battle_royale:${player.userId}`;
+    const refId = `${room.code}:battle_royale:${room.roundId || 1}:${player.userId}`;
     const dbClient = await pool.connect();
     try {
       await dbClient.query("BEGIN");
@@ -1098,6 +1184,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       status: "waiting",
       createdAt: Date.now(),
       startedAt: 0,
+      roundId: 0,
       firstZombieDone: false,
       resultFinalized: false,
       players: new Map(),
