@@ -100,6 +100,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     client.on("invite_friend", (data, ack) => inviteFriend(client, data, ack));
     client.on("accept_invite", (data, ack) => acceptInvite(client, data, ack));
     client.on("player_ready", (data) => setReady(client, data));
+    client.on("return_to_lobby", () => markReturnedToLobby(client));
     client.on("start_game", () => startGameByHost(client));
     client.on("position_update", (data) => updatePosition(client, data));
     client.on("player_infected", (data) => requestInfection(client, data));
@@ -304,7 +305,19 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     if (!room || room.status !== "waiting") return;
     const player = room.players.get(client.userId);
     if (!player) return;
+    player.returnedToLobby = true;
     player.ready = Boolean(data.ready);
+    broadcastRoom(room, "room_updated", serializeRoom(room));
+    updateFullRoomAutoStart(room);
+  }
+
+  function markReturnedToLobby(client) {
+    const room = getClientRoom(client);
+    if (!room || room.status !== "waiting") return;
+    const player = room.players.get(client.userId);
+    if (!player) return;
+    player.returnedToLobby = true;
+    player.ready = true;
     broadcastRoom(room, "room_updated", serializeRoom(room));
     updateFullRoomAutoStart(room);
   }
@@ -318,6 +331,9 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       return sendRequestFailed(client, null, "start_game", "tag_needs_six_players");
     }
     if (room.players.size < 2) return sendRequestFailed(client, null, "start_game", "not_enough_players");
+    if (!allPlayersReturnedToLobby(room)) {
+      return sendRequestFailed(client, null, "start_game", "players_not_in_lobby");
+    }
     if ([...room.players.values()].some((player) => !player.ready)) {
       return sendRequestFailed(client, null, "start_game", "players_not_ready");
     }
@@ -333,6 +349,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     }
     clearFullRoomAutoStart(room);
     room.status = "playing";
+    room.awaitingLobbyReturn = false;
     room.startedAt = Date.now();
     room.roundId = (room.roundId || 0) + 1;
     room.firstZombieDone = false;
@@ -364,6 +381,11 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       broadcastRoom(room, "room_updated", serializeRoom(room));
       return;
     }
+    if (!allPlayersReturnedToLobby(room) || [...room.players.values()].some((player) => !player.ready)) {
+      clearFullRoomAutoStart(room);
+      broadcastRoom(room, "room_updated", serializeRoom(room));
+      return;
+    }
     const full = room.players.size >= room.maxPlayers;
     if (!full) {
       clearFullRoomAutoStart(room);
@@ -387,8 +409,17 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
         broadcastRoom(room, "room_updated", serializeRoom(room));
         return;
       }
+      if (!allPlayersReturnedToLobby(room) || [...room.players.values()].some((player) => !player.ready)) {
+        room.autoStartAt = 0;
+        broadcastRoom(room, "room_updated", serializeRoom(room));
+        return;
+      }
       startRoom(room);
     }, 5_000);
+  }
+
+  function allPlayersReturnedToLobby(room) {
+    return [...room.players.values()].every((player) => player.returnedToLobby !== false);
   }
 
   function clearFullRoomAutoStart(room) {
@@ -434,12 +465,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     player.shield = Boolean(data.shield);
     player.updatedAt = now;
     player.positionInitialized = true;
-    if (room.mode === "tag" && player.status === "jailed") {
-      player.x = TAG_PRISON.x;
-      player.y = TAG_PRISON.y;
-      player.vx = 0;
-      player.vy = 0;
-    }
+    if (room.mode === "tag" && player.status === "jailed") clampPlayerToTagPrison(player);
     serverCheckInfections(room);
     serverCheckTags(room);
     serverCheckBattleRoyale(room);
@@ -602,7 +628,20 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     if (players.length === 0) return;
     const now = Date.now();
     const taggerCount = Math.min(TAG_TAGGER_COUNT, Math.max(1, players.length - 1));
+    const runnerSpawns = [
+      { x: TAG_PRISON.x + 430, y: TAG_PRISON.y - 310 },
+      { x: TAG_PRISON.x + 500, y: TAG_PRISON.y + 0 },
+      { x: TAG_PRISON.x + 430, y: TAG_PRISON.y + 310 },
+      { x: TAG_PRISON.x - 120, y: TAG_PRISON.y + 430 },
+      { x: TAG_PRISON.x + 120, y: TAG_PRISON.y - 430 },
+      { x: TAG_PRISON.x + 620, y: TAG_PRISON.y + 210 },
+    ];
+    const taggerSpawns = [
+      { x: TAG_PRISON.x - 520, y: TAG_PRISON.y - 260 },
+      { x: TAG_PRISON.x - 520, y: TAG_PRISON.y + 260 },
+    ];
     for (const player of players) {
+      const spawn = runnerSpawns[players.indexOf(player) % runnerSpawns.length];
       player.status = "runner";
       player.role = "runner";
       player.tagImmuneUntil = now + TAG_IMMUNITY_MS;
@@ -620,8 +659,8 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       player.smokeUntil = 0;
       player.jailedAt = 0;
       player.rescuedCount = 0;
-      player.x = TAG_PRISON.x + 250 + Math.cos(players.indexOf(player)) * 180;
-      player.y = TAG_PRISON.y + Math.sin(players.indexOf(player)) * 180;
+      player.x = spawn.x;
+      player.y = spawn.y;
       player.positionInitialized = true;
     }
     const shuffled = players.slice().sort(() => Math.random() - 0.5);
@@ -631,8 +670,9 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       tagger.role = "tagger";
       tagger.tagImmuneUntil = 0;
       tagger.nextTagAllowedUntil = now + TAG_IMMUNITY_MS;
-      tagger.x = TAG_PRISON.x - 320 - i * 85;
-      tagger.y = TAG_PRISON.y - 140 + i * 280;
+      const spawn = taggerSpawns[i % taggerSpawns.length];
+      tagger.x = spawn.x;
+      tagger.y = spawn.y;
     }
     if (room.tagVariant === "item") {
       room.tagItemSelectUntil = now + TAG_ITEM_SELECT_MS;
@@ -968,6 +1008,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     clearInterval(room.syncTimer);
     clearFullRoomAutoStart(room);
     room.status = "waiting";
+    room.awaitingLobbyReturn = true;
     room.startedAt = 0;
     room.firstZombieDone = false;
     room.resultFinalized = false;
@@ -976,13 +1017,14 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     room.tagItemRoundStarted = false;
     room.prisonSentinel = {};
     room.tagRescue = { rescuerId: "", startedAt: 0, targetId: "" };
-    for (const player of room.players.values()) resetPlayerForLobby(room, player);
+    for (const player of room.players.values()) resetPlayerForLobby(room, player, true);
     broadcastRoom(room, "room_updated", serializeRoom(room));
     updateFullRoomAutoStart(room);
   }
 
-  function resetPlayerForLobby(room, player) {
-    player.ready = player.userId === room.hostId;
+  function resetPlayerForLobby(room, player, afterResult = false) {
+    player.ready = false;
+    player.returnedToLobby = !afterResult;
     player.isHost = player.userId === room.hostId;
     player.status = "alive";
     player.role = "survivor";
@@ -1361,6 +1403,8 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
         is_host: player.isHost,
         ready: player.ready,
         is_ready: player.ready,
+        returned_to_lobby: player.returnedToLobby !== false,
+        in_lobby: player.returnedToLobby !== false,
         status: player.status,
         role: player.role,
         hp: player.hp || 0,
@@ -1587,6 +1631,17 @@ function sanitizePositionUpdate(player, data, now) {
     x: from.x + dx * ratio,
     y: from.y + dy * ratio,
   };
+}
+
+function clampPlayerToTagPrison(player) {
+  const dx = (Number(player.x) || 0) - TAG_PRISON.x;
+  const dy = (Number(player.y) || 0) - TAG_PRISON.y;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  const maxDist = Math.max(8, TAG_PRISON_RADIUS - 16);
+  if (dist <= maxDist || dist <= 0.001) return;
+  const ratio = maxDist / dist;
+  player.x = TAG_PRISON.x + dx * ratio;
+  player.y = TAG_PRISON.y + dy * ratio;
 }
 
 function finiteNumber(value) {
