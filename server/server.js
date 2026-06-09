@@ -1,5 +1,5 @@
 import cors from "cors";
-import { createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import { createHmac, createPublicKey, randomBytes, randomUUID, scryptSync, timingSafeEqual, verify as verifySignature } from "node:crypto";
 import dotenv from "dotenv";
 import express from "express";
 import http from "node:http";
@@ -25,6 +25,12 @@ const port = Number(process.env.PORT || 8787);
 const publicBaseUrl = process.env.PUBLIC_BASE_URL || "";
 const loginSessions = new Map();
 const oauthStates = new Map();
+const admobSsvKeyUrl = "https://gstatic.com/admob/reward/verifier-keys.json";
+let admobSsvKeysCache = { expiresAt: 0, keys: new Map() };
+const devRewardVerificationEnabled =
+  process.env.ENABLE_DEV_AD_REWARD_VERIFY === "1" ||
+  process.env.NODE_ENV === "development" ||
+  process.env.NODE_ENV === "test";
 
 app.use(cors());
 app.use(express.json({ limit: "64kb" }));
@@ -32,6 +38,7 @@ app.use(express.json({ limit: "64kb" }));
 const io = new SocketIOServer(httpServer, {
   cors: { origin: "*", methods: ["GET", "POST"] },
 });
+const onlineUserIds = new Set();
 const realtimeRooms = new Map();
 
 // ─── Static Definitions ───────────────────────────────────────────────────────
@@ -100,11 +107,15 @@ const DAILY_QUESTS = [
 ];
 
 const SHOP_ITEMS = {
-  "skin_default":    { category: "skin",       name: "기본 구체",     desc: "처음부터 지급",          icon: "○", price: 0 },
-  "skin_ice":        { category: "skin",       name: "아이스 볼",     desc: "차가운 푸른 빛",         icon: "●", price: 1500 },
-  "skin_fire":       { category: "skin",       name: "파이어 볼",     desc: "불꽃 트레일 자동 포함",  icon: "●", price: 1500, badge: "HOT" },
-  "skin_cyber":      { category: "skin",       name: "사이버 링",     desc: "회전하는 외곽 링",       icon: "◉", price: 4000, badge: "NEW" },
-  "skin_star":       { category: "skin",       name: "스타 코어",     desc: "별빛 코어",              icon: "✦", price: 15000, badge: "SEASON" },
+  "skin_default":    { category: "skin",       name: "스카우트 유닛", desc: "처음부터 지급",          icon: "", price: 0 },
+  "skin_ice":        { category: "skin",       name: "프로스트 셔틀", desc: "차가운 결정형 바디",     icon: "", price: 1500 },
+  "skin_fire":       { category: "skin",       name: "블레이즈 팟",   desc: "추진 바디",              icon: "", price: 1500, badge: "HOT" },
+  "skin_cyber":      { category: "skin",       name: "네온 링",       desc: "네온 링 유닛",           icon: "", price: 4000, badge: "NEW" },
+  "skin_star":       { category: "skin",       name: "스타 윙",       desc: "별빛 윙 바디",           icon: "", price: 15000, badge: "SEASON" },
+  "skin_drone":      { category: "skin",       name: "네온 드론",     desc: "작은 전투 드론 실루엣",   icon: "▰", price: 5200, badge: "NEW" },
+  "skin_capsule":    { category: "skin",       name: "마그넷 캡슐",   desc: "떠 있는 캡슐 바디",       icon: "▮", price: 5200 },
+  "skin_raptor":     { category: "skin",       name: "랩터 코어",     desc: "날개 달린 공격형 코어",   icon: "◆", price: 6200, badge: "RARE" },
+  "skin_satellite":  { category: "skin",       name: "위성 유닛",     desc: "위성이 도는 탐사용 유닛", icon: "◌", price: 6200 },
   "trail_none":      { category: "trail",      name: "없음",          desc: "기본",                   icon: "-", price: 0 },
   "trail_wind":      { category: "trail",      name: "바람 흔적",     desc: "반투명 연기 잔상",       icon: "~", price: 800 },
   "trail_lightning": { category: "trail",      name: "번개 궤적",     desc: "전기 스파크",            icon: "⚡", price: 2500, badge: "HOT" },
@@ -125,11 +136,11 @@ const SHOP_ITEMS = {
 
 const SHOP_BUNDLES = {
   "bundle_starter": {
-    name: "스타터 팩", desc: "아이스 볼 + 바람 흔적 + 육각 방어막",
+    name: "스타터 팩", desc: "프로스트 셔틀 + 바람 흔적 + 육각 방어막",
     price: 3000, was: 3800, item_ids: ["skin_ice", "trail_wind", "shield_hex"], tag: "21% 할인",
   },
   "bundle_fire": {
-    name: "파이어 패키지", desc: "파이어 볼 + 번개 궤적 + 불꽃 방어막",
+    name: "파이어 패키지", desc: "블레이즈 팟 + 번개 궤적 + 불꽃 방어막",
     price: 5000, was: 6500, item_ids: ["skin_fire", "trail_lightning", "shield_fire"], tag: "23% 할인",
   },
   "bundle_master": {
@@ -140,6 +151,8 @@ const SHOP_BUNDLES = {
 
 const DEFAULT_OWNED = ["skin_default", "trail_none", "death_default", "shield_default", "bg_void"];
 const DEFAULT_EQUIPPED = { skin: "skin_default", trail: "trail_none", death: "death_default", shield: "shield_default", background: "bg_void" };
+const ATTENDANCE_BASE_COINS = 20;
+const ATTENDANCE_WEEKLY_BONUS_COINS = 50;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -183,33 +196,13 @@ function normalizeModeData(mode, body = {}) {
     mode_score_bonus: Math.max(0, cleanInt(body.mode_score_bonus, 0)),
     coins_earned: Math.max(0, cleanInt(raw.coins_earned ?? body.coins_earned, 0)),
   };
-  if (mode === "food_chain") {
+  if (mode === "air_raid") {
     return {
       ...common,
-      max_radius: Math.max(0, cleanNumber(raw.max_radius ?? body.mode_metric_primary, 0)),
-      absorbed_bots: Math.max(0, cleanInt(raw.absorbed_bots ?? body.mode_metric_secondary, 0)),
+      survived_seconds: Math.max(0, cleanNumber(raw.survived_seconds ?? body.mode_metric_primary, 0)),
+      shots_fired: Math.max(0, cleanInt(raw.shots_fired ?? body.mode_metric_secondary, 0)),
       p_count: Math.max(0, cleanInt(raw.p_count ?? body.p_count, 0)),
-      coins_earned: Math.max(0, cleanInt(raw.coins_earned, 0)),
-      runner_rewards: Math.max(0, cleanInt(raw.runner_rewards, 0)),
-      golden_orbs: Math.max(0, cleanInt(raw.golden_orbs, 0)),
-    };
-  }
-  if (mode === "bounce") {
-    return {
-      ...common,
-      surge_level: Math.max(0, cleanInt(raw.surge_level ?? body.mode_metric_secondary, 0)),
-      upgrade_count: Math.max(0, cleanInt(raw.upgrade_count ?? body.mode_metric_secondary, 0)),
-      upgrades: cleanTextArray(raw.upgrades, 48, 36),
-      missiles_hit: Math.max(0, cleanInt(raw.missiles_hit, 0)),
-      golden_orbs: Math.max(0, cleanInt(raw.golden_orbs, 0)),
-      diamond_orbs: Math.max(0, cleanInt(raw.diamond_orbs, 0)),
-    };
-  }
-  if (mode === "territory") {
-    return {
-      ...common,
-      zone_time: Math.max(0, cleanNumber(raw.zone_time ?? body.mode_metric_primary, 0)),
-      escape_bonus: Math.max(0, cleanInt(raw.escape_bonus ?? body.mode_metric_secondary, 0)),
+      survival_bonus: Math.max(0, cleanInt(raw.survival_bonus ?? body.mode_score_bonus, 0)),
     };
   }
   if (mode === "tag") {
@@ -295,6 +288,20 @@ app.get("/", (_req, res) => {
 app.get("/health", async (_req, res) => {
   await pool.query("SELECT 1");
   res.json({ ok: true });
+});
+
+app.get("/account-deletion", (_req, res) => {
+  res.type("html").send(`<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Laser Dodge 계정 및 데이터 삭제</title>
+<body style="font-family:system-ui,sans-serif;line-height:1.6;max-width:720px;margin:40px auto;padding:0 20px">
+<h1>Laser Dodge 계정 및 데이터 삭제</h1>
+<p>앱에서 로그인한 뒤 설정 화면의 회원탈퇴를 누르면 계정과 관련 데이터 삭제를 요청할 수 있습니다.</p>
+<p>앱을 사용할 수 없는 경우 <a href="mailto:rkdduf44@naver.com">rkdduf44@naver.com</a>으로 닉네임, 로그인 방식, 삭제 요청 내용을 보내 주세요.</p>
+<p>삭제 대상: 계정, 닉네임, 랭킹/점수, 코인, 상점/장착 정보, 친구 관계, 멀티플레이 결과. 법령상 보관이 필요한 항목은 필요한 기간 동안 보관될 수 있습니다.</p>
+</body></html>`);
 });
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
@@ -577,7 +584,7 @@ app.get("/users/:userId/rank", async (req, res) => {
   const mode = cleanModeId(req.query.mode);
   const best = await getUserBestScore(req.params.userId, mode);
   if (!best) return res.json({ rank: null });
-  res.json({ rank: await getRank(best.total_score, best.survival_time, mode) });
+  res.json({ rank: await getRank(best.total_score, best.survival_time, mode), record: best });
 });
 
 // ─── Friends ──────────────────────────────────────────────────────────────────
@@ -675,7 +682,11 @@ app.get("/friends", async (req, res) => {
      ORDER BY f.created_at DESC`,
     [payload.sub],
   );
-  res.json({ friends: friends.rows, sent: sent.rows, received: received.rows });
+  res.json({
+    friends: friends.rows.map((friend) => ({ ...friend, online: onlineUserIds.has(String(friend.id)) })),
+    sent: sent.rows,
+    received: received.rows,
+  });
 });
 
 app.get("/friends/ranking", async (req, res) => {
@@ -822,33 +833,53 @@ app.get("/v1/wallet", async (req, res) => {
 // ─── V1: Attendance ───────────────────────────────────────────────────────────
 
 app.post("/v1/attendance/checkin", async (req, res) => {
-  const payload = requireAuth(req, res);
-  if (!payload) return;
-  const today = todayUtc();
+	const payload = requireAuth(req, res);
+	if (!payload) return;
+	const today = todayUtc();
 
-  const stats = await getUserStats(payload.sub);
-  if (stats.last_attendance_date === today) {
-    return res.json({ already_checked_in: true, streak: stats.attendance_streak, total: stats.attendance_total });
-  }
+	const stats = await getUserStats(payload.sub);
+	if (stats.last_attendance_date === today) {
+		const r = await pool.query("SELECT coin_balance FROM users WHERE id = $1", [payload.sub]);
+		const balance = r.rowCount > 0 ? r.rows[0].coin_balance : 0;
+		return res.json({ already_checked_in: true, streak: stats.attendance_streak, total: stats.attendance_total, coins_awarded: 0, coins: balance, balance });
+	}
 
   const yesterday = new Date(today);
   yesterday.setDate(yesterday.getDate() - 1);
   const yesterdayStr = yesterday.toISOString().slice(0, 10);
 
-  const newStreak = stats.last_attendance_date === yesterdayStr ? stats.attendance_streak + 1 : 1;
-  const newTotal = stats.attendance_total + 1;
+	const newStreak = stats.last_attendance_date === yesterdayStr ? stats.attendance_streak + 1 : 1;
+	const newTotal = stats.attendance_total + 1;
+	const coinsAwarded = ATTENDANCE_BASE_COINS + (newStreak % 7 === 0 ? ATTENDANCE_WEEKLY_BONUS_COINS : 0);
 
-  await pool.query(
-    `UPDATE user_game_stats SET attendance_streak = $1, attendance_total = $2, last_attendance_date = $3, updated_at = now()
-     WHERE user_id = $4`,
-    [newStreak, newTotal, today, payload.sub],
-  );
+	const client = await pool.connect();
+	try {
+		await client.query("BEGIN");
+		await client.query(
+			`UPDATE user_game_stats SET attendance_streak = $1, attendance_total = $2, last_attendance_date = $3, updated_at = now()
+			 WHERE user_id = $4`,
+			[newStreak, newTotal, today, payload.sub],
+		);
+		await client.query("UPDATE users SET coin_balance = coin_balance + $1 WHERE id = $2", [coinsAwarded, payload.sub]);
+		await client.query(
+			"INSERT INTO coin_transactions (user_id, amount, reason, ref_id) VALUES ($1, $2, $3, $4)",
+			[payload.sub, coinsAwarded, "attendance_reward", today],
+		);
+		await client.query("COMMIT");
+	} catch (e) {
+		await client.query("ROLLBACK");
+		throw e;
+	} finally {
+		client.release();
+	}
 
-  // Check attendance achievements
-  const updatedStats = { ...stats, attendance_streak: newStreak, attendance_total: newTotal, last_attendance_date: today };
-  const newlyUnlocked = await checkAndUnlockAchievements(payload.sub, updatedStats);
+	// Check attendance achievements
+	const updatedStats = { ...stats, attendance_streak: newStreak, attendance_total: newTotal, last_attendance_date: today };
+	const newlyUnlocked = await checkAndUnlockAchievements(payload.sub, updatedStats);
+	const r = await pool.query("SELECT coin_balance FROM users WHERE id = $1", [payload.sub]);
+	const balance = r.rowCount > 0 ? r.rows[0].coin_balance : 0;
 
-  res.json({ checked_in: true, streak: newStreak, total: newTotal, achievements_unlocked: newlyUnlocked });
+	res.json({ checked_in: true, streak: newStreak, total: newTotal, coins_awarded: coinsAwarded, coins: balance, balance, achievements_unlocked: newlyUnlocked });
 });
 
 // ─── V1: Achievements ─────────────────────────────────────────────────────────
@@ -1006,7 +1037,7 @@ app.post("/v1/daily-quests/claim", async (req, res) => {
     );
     await client.query(
       "INSERT INTO coin_transactions (user_id, amount, reason, ref_id) VALUES ($1, $2, $3, $4)",
-      [payload.sub, quest.reward, "daily_quest_reward", questId],
+      [payload.sub, quest.reward, "daily_quest_reward", `${today}:${questId}`],
     );
     const r = await client.query("SELECT coin_balance FROM users WHERE id = $1", [payload.sub]);
     await client.query("COMMIT");
@@ -1058,18 +1089,17 @@ app.post("/v1/shop/buy", async (req, res) => {
     );
     if (alreadyOwned.rowCount > 0) return res.status(409).json({ error: "already_owned" });
 
-    const userRow = await pool.query("SELECT coin_balance FROM users WHERE id = $1", [payload.sub]);
-    if (userRow.rows[0].coin_balance < item.price) {
-      return res.status(402).json({ error: "insufficient_coins" });
-    }
-
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      await client.query(
-        "UPDATE users SET coin_balance = coin_balance - $1 WHERE id = $2",
+      const debit = await client.query(
+        "UPDATE users SET coin_balance = coin_balance - $1 WHERE id = $2 AND coin_balance >= $1 RETURNING coin_balance",
         [item.price, payload.sub],
       );
+      if (debit.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(402).json({ error: "insufficient_coins" });
+      }
       await client.query(
         "INSERT INTO user_inventory (user_id, item_id) VALUES ($1, $2)",
         [payload.sub, itemId],
@@ -1078,9 +1108,8 @@ app.post("/v1/shop/buy", async (req, res) => {
         "INSERT INTO coin_transactions (user_id, amount, reason, ref_id) VALUES ($1, $2, $3, $4)",
         [payload.sub, -item.price, "shop_purchase", itemId],
       );
-      const r = await client.query("SELECT coin_balance FROM users WHERE id = $1", [payload.sub]);
       await client.query("COMMIT");
-      res.json({ success: true, item_id: itemId, new_balance: r.rows[0].coin_balance });
+      res.json({ success: true, item_id: itemId, new_balance: debit.rows[0].coin_balance });
     } catch (e) {
       await client.query("ROLLBACK");
       throw e;
@@ -1092,18 +1121,25 @@ app.post("/v1/shop/buy", async (req, res) => {
     const bundle = SHOP_BUNDLES[bundleId];
     if (!bundle) return res.status(400).json({ error: "bundle_not_found" });
 
-    const userRow = await pool.query("SELECT coin_balance FROM users WHERE id = $1", [payload.sub]);
-    if (userRow.rows[0].coin_balance < bundle.price) {
-      return res.status(402).json({ error: "insufficient_coins" });
+    const ownedRows = await pool.query(
+      "SELECT item_id FROM user_inventory WHERE user_id = $1 AND item_id = ANY($2::text[])",
+      [payload.sub, bundle.item_ids],
+    );
+    if (ownedRows.rowCount >= bundle.item_ids.length) {
+      return res.status(409).json({ error: "already_owned" });
     }
 
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      await client.query(
-        "UPDATE users SET coin_balance = coin_balance - $1 WHERE id = $2",
+      const debit = await client.query(
+        "UPDATE users SET coin_balance = coin_balance - $1 WHERE id = $2 AND coin_balance >= $1 RETURNING coin_balance",
         [bundle.price, payload.sub],
       );
+      if (debit.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(402).json({ error: "insufficient_coins" });
+      }
       for (const id of bundle.item_ids) {
         await client.query(
           "INSERT INTO user_inventory (user_id, item_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
@@ -1114,9 +1150,8 @@ app.post("/v1/shop/buy", async (req, res) => {
         "INSERT INTO coin_transactions (user_id, amount, reason, ref_id) VALUES ($1, $2, $3, $4)",
         [payload.sub, -bundle.price, "bundle_purchase", bundleId],
       );
-      const r = await client.query("SELECT coin_balance FROM users WHERE id = $1", [payload.sub]);
       await client.query("COMMIT");
-      res.json({ success: true, bundle_id: bundleId, item_ids: bundle.item_ids, new_balance: r.rows[0].coin_balance });
+      res.json({ success: true, bundle_id: bundleId, item_ids: bundle.item_ids, new_balance: debit.rows[0].coin_balance });
     } catch (e) {
       await client.query("ROLLBACK");
       throw e;
@@ -1182,6 +1217,28 @@ app.post("/v1/wallet/ad-reward", async (req, res) => {
   const payload = requireAuth(req, res);
   if (!payload) return;
 
+  const sessionToken = String(req.body.session_token || "").trim();
+  if (!sessionToken) return res.status(400).json({ error: "reward_session_required" });
+  const session = await pool.query(
+    `SELECT session_token, verified_at, claimed_at, expires_at
+     FROM ad_reward_sessions
+     WHERE user_id = $1 AND session_token = $2`,
+    [payload.sub, sessionToken],
+  );
+  if (session.rowCount === 0) return res.status(404).json({ error: "reward_session_not_found" });
+  const row = session.rows[0];
+  if (!row.verified_at) return res.status(202).json({ status: "pending_verification" });
+  if (!row.claimed_at) {
+    await pool.query("UPDATE ad_reward_sessions SET claimed_at = now() WHERE user_id = $1 AND session_token = $2", [payload.sub, sessionToken]);
+  }
+  const balanceRow = await pool.query("SELECT coin_balance FROM users WHERE id = $1", [payload.sub]);
+  res.json({ coins_added: row.claimed_at ? 0 : 15, new_balance: balanceRow.rows[0].coin_balance, status: "verified" });
+});
+
+app.post("/v1/wallet/ad-reward/session", async (req, res) => {
+  const payload = requireAuth(req, res);
+  if (!payload) return;
+
   const today = todayUtc();
   const countRow = await pool.query(
     `SELECT COUNT(*) AS cnt FROM coin_transactions
@@ -1191,8 +1248,47 @@ app.post("/v1/wallet/ad-reward", async (req, res) => {
   const usedToday = Number(countRow.rows[0].cnt);
   if (usedToday >= 5) return res.status(429).json({ error: "daily_limit_reached", limit: 5, used: usedToday });
 
-  const newBalance = await addCoins(payload.sub, 15, "ad_reward");
-  res.json({ coins_added: 15, new_balance: newBalance, used_today: usedToday + 1, limit: 5 });
+  const sessionToken = randomBytes(18).toString("base64url");
+  await pool.query(
+    `INSERT INTO ad_reward_sessions (user_id, session_token, expires_at)
+     VALUES ($1, $2, now() + interval '15 minutes')`,
+    [payload.sub, sessionToken],
+  );
+  res.json({ session_token: sessionToken, custom_data: sessionToken, used_today: usedToday, limit: 5 });
+});
+
+app.get("/v1/wallet/ad-reward/ssv", async (req, res) => {
+  try {
+    await verifyAdMobSsvRequest(req);
+    const sessionToken = cleanShortText(req.query.custom_data, 120);
+    const transactionId = cleanShortText(req.query.transaction_id, 120);
+    const rewardAmount = Math.max(0, cleanInt(req.query.reward_amount, 0));
+    const adUnit = cleanShortText(req.query.ad_unit, 120);
+    if (!sessionToken || !transactionId) return res.send("OK");
+    await verifyAdRewardSession(sessionToken, transactionId, rewardAmount, adUnit);
+    res.send("OK");
+  } catch (error) {
+    console.warn("[admob-ssv] rejected callback", { error: error?.message || String(error) });
+    res.status(400).send("invalid_callback");
+  }
+});
+
+app.post("/dev/ad-reward/verify", async (req, res) => {
+  if (!devRewardVerificationEnabled) return res.status(404).json({ error: "not_found" });
+  const payload = requireAuth(req, res);
+  if (!payload) return;
+  const sessionToken = cleanShortText(req.body.session_token, 120);
+  if (!sessionToken) return res.status(400).json({ error: "reward_session_required" });
+  const transactionId = cleanShortText(req.body.transaction_id || `dev-${randomUUID()}`, 120);
+  try {
+    await verifyAdRewardSession(sessionToken, transactionId, 15, "dev");
+    const balanceRow = await pool.query("SELECT coin_balance FROM users WHERE id = $1", [payload.sub]);
+    res.json({ ok: true, session_token: sessionToken, transaction_id: transactionId, new_balance: balanceRow.rows[0].coin_balance });
+  } catch (error) {
+    const statusCode = Number(error?.statusCode || 500);
+    if (statusCode >= 400 && statusCode < 500) return res.status(statusCode).json({ error: error.message });
+    throw error;
+  }
 });
 
 // ─── Socket.io Realtime Multiplayer ──────────────────────────────────────────
@@ -1668,6 +1764,92 @@ function timingSafeStringEqual(left, right) {
   const r = Buffer.from(String(right));
   return l.length === r.length && timingSafeEqual(l, r);
 }
+async function verifyAdMobSsvRequest(req) {
+  const originalUrl = req.originalUrl || "";
+  const queryString = originalUrl.includes("?") ? originalUrl.slice(originalUrl.indexOf("?") + 1) : "";
+  const signatureMarker = "signature=";
+  const signatureIndex = queryString.indexOf(signatureMarker);
+  if (signatureIndex <= 0) throw new Error("missing_signature");
+  const signedContent = queryString.slice(0, signatureIndex - 1);
+  const signature = String(req.query.signature || "");
+  const keyId = String(req.query.key_id || "");
+  if (!signature || !keyId) throw new Error("missing_signature_or_key");
+  const keys = await getAdMobSsvKeys();
+  const publicKey = keys.get(keyId);
+  if (!publicKey) throw new Error("unknown_key_id");
+  const ok = verifySignature(
+    "sha256",
+    Buffer.from(signedContent, "utf8"),
+    { key: publicKey, dsaEncoding: "der" },
+    Buffer.from(signature, "base64url"),
+  );
+  if (!ok) throw new Error("bad_signature");
+}
+async function verifyAdRewardSession(sessionToken, transactionId, rewardAmount = 15, adUnit = "") {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`ad_reward:${transactionId}`]);
+    const session = await client.query(
+      `SELECT user_id, verified_at, expires_at
+       FROM ad_reward_sessions
+       WHERE session_token = $1
+       FOR UPDATE`,
+      [sessionToken],
+    );
+    if (session.rowCount === 0) {
+      const error = new Error("session_not_found");
+      error.statusCode = 404;
+      throw error;
+    }
+    const rewardSession = session.rows[0];
+    if (new Date(rewardSession.expires_at).getTime() < Date.now()) {
+      const error = new Error("session_expired");
+      error.statusCode = 410;
+      throw error;
+    }
+    if (!rewardSession.verified_at) {
+      await client.query(
+        `UPDATE ad_reward_sessions
+         SET verified_at = now(), transaction_id = $2, reward_amount = $3, ad_unit = $4
+         WHERE session_token = $1`,
+        [sessionToken, transactionId, rewardAmount, adUnit],
+      );
+      await client.query("UPDATE users SET coin_balance = coin_balance + 15 WHERE id = $1", [rewardSession.user_id]);
+      await client.query(
+        "INSERT INTO coin_transactions (user_id, amount, reason, ref_id) VALUES ($1, 15, 'ad_reward', $2)",
+        [rewardSession.user_id, transactionId],
+      );
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+async function getAdMobSsvKeys() {
+  if (Date.now() < admobSsvKeysCache.expiresAt && admobSsvKeysCache.keys.size > 0) {
+    return admobSsvKeysCache.keys;
+  }
+  const response = await fetch(admobSsvKeyUrl);
+  if (!response.ok) throw new Error(`admob_keys_http_${response.status}`);
+  const data = await response.json();
+  const keys = new Map();
+  for (const item of data.keys || []) {
+    const id = String(item.keyId ?? item.key_id ?? "");
+    if (!id) continue;
+    if (item.pem) {
+      keys.set(id, createPublicKey(item.pem));
+    } else if (item.base64) {
+      keys.set(id, createPublicKey({ key: Buffer.from(String(item.base64), "base64"), format: "der", type: "spki" }));
+    }
+  }
+  if (keys.size === 0) throw new Error("admob_keys_empty");
+  admobSsvKeysCache = { expiresAt: Date.now() + 12 * 60 * 60 * 1000, keys };
+  return keys;
+}
 function callbackUrl(provider) { return `${publicBaseUrl}/auth/${provider}/callback`; }
 function buildGoogleAuthUrl(sessionId, state) {
   if (!process.env.GOOGLE_CLIENT_ID) return null;
@@ -1886,6 +2068,20 @@ async function ensureSchema() {
   );
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS ad_reward_sessions (
+      session_token TEXT PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      transaction_id TEXT UNIQUE,
+      reward_amount INTEGER NOT NULL DEFAULT 0,
+      ad_unit TEXT NOT NULL DEFAULT '',
+      verified_at TIMESTAMPTZ,
+      claimed_at TIMESTAMPTZ,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query("CREATE INDEX IF NOT EXISTS ad_reward_sessions_user_idx ON ad_reward_sessions (user_id, created_at DESC)");
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS friendships (
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       friend_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1977,7 +2173,7 @@ async function ensureSchema() {
 
 await ensureSchema();
 
-attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken, makeRoomCode });
+attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken, makeRoomCode, onlineUserIds });
 
 httpServer.listen(port, "0.0.0.0", () => {
   console.log(`Laser Dodge API v2 listening on http://0.0.0.0:${port}`);
