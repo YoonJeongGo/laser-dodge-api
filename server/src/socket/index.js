@@ -38,6 +38,13 @@ const TAG_SENTINEL_MS = 18_000;
 const TAG_CLONE_MS = 5_000;
 const TAG_SPEED_ITEM_MS = 6_000;
 const TAG_SMOKE_MS = 4_000;
+const TAG_CLONE_SPEED = 260;
+const TAG_SENTINEL_SPEED = 330;
+const TAG_SENTINEL_TOUCH_RADIUS = 34;
+const TAG_SPEED_ORB_MS = 8000;
+const TAG_SPEED_ORB_SPAWN_MS = 1200;
+const TAG_SPEED_ORB_RADIUS = 16;
+const TAG_SPEED_PICKUP_MS = 200;
 const POSITION_MIN_INTERVAL_MS = 12;
 const POSITION_MAX_ABS = 200_000;
 const POSITION_MAX_SPEED = 1_600;
@@ -581,18 +588,21 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       target.tagSlowUntil = now + TAG_MISSILE_SLOW_MS;
       broadcastRoom(room, "tag_event", { type: "item_effect", item_id: itemId, user_id: player.userId, target_user_id: target.userId, until: target.tagSlowUntil, room: serializeRoom(room) });
     } else if (itemId === "prison_sentinel") {
+      if (!room.tagRescue || !room.tagRescue.startedAt) return;
       player.tagItemReadyAt = now + (TAG_ITEM_COOLDOWNS[itemId] || 12_000);
+      const sentinel = spawnTagSentinel(room, player, now);
       room.prisonSentinel = { ownerId: player.userId, until: now + TAG_SENTINEL_MS };
-      broadcastRoom(room, "tag_event", { type: "item_effect", item_id: itemId, user_id: player.userId, until: room.prisonSentinel.until, room: serializeRoom(room) });
+      broadcastRoom(room, "tag_event", { type: "item_effect", item_id: itemId, user_id: player.userId, sentinel_id: sentinel.id, until: room.prisonSentinel.until, room: serializeRoom(room) });
     } else if (itemId === "runner_clone") {
       player.tagItemReadyAt = now + (TAG_ITEM_COOLDOWNS[itemId] || 12_000);
       player.cloneUntil = now + TAG_CLONE_MS;
+      spawnTagClones(room, player, now);
       broadcastRoom(room, "tag_event", { type: "item_effect", item_id: itemId, user_id: player.userId, until: player.cloneUntil, room: serializeRoom(room) });
     } else if (itemId === "runner_speed_points") {
       player.tagItemReadyAt = now + (TAG_ITEM_COOLDOWNS[itemId] || 12_000);
-      player.runnerSpeedUntil = now + TAG_SPEED_ITEM_MS;
-      player.runnerSpeedStacks = Math.min(3, (player.runnerSpeedStacks || 0) + 1);
-      broadcastRoom(room, "tag_event", { type: "item_effect", item_id: itemId, user_id: player.userId, until: player.runnerSpeedUntil, room: serializeRoom(room) });
+      player.speedPointModeUntil = now + TAG_SPEED_ITEM_MS;
+      player.nextSpeedOrbAt = now;
+      broadcastRoom(room, "tag_event", { type: "item_effect", item_id: itemId, user_id: player.userId, until: player.speedPointModeUntil, room: serializeRoom(room) });
     } else if (itemId === "runner_smoke") {
       player.tagItemReadyAt = now + (TAG_ITEM_COOLDOWNS[itemId] || 12_000);
       player.smokeUntil = now + TAG_SMOKE_MS;
@@ -846,6 +856,111 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     if (aliveRunners <= 0) finishTagRoom(room, reason || "taggers_win");
   }
 
+  function spawnTagClones(room, owner, now) {
+    room.tagClones = Array.isArray(room.tagClones) ? room.tagClones : [];
+    const baseAngle = Math.atan2(Number(owner.vy) || 0, Number(owner.vx) || 1);
+    for (let i = 0; i < 2; i += 1) {
+      const angle = baseAngle + (i === 0 ? 0.72 : -0.72) + (Math.random() - 0.5) * 0.35;
+      room.tagClones.push({
+        id: `${owner.userId}:clone:${now}:${i}`,
+        ownerId: owner.userId,
+        nickname: owner.nickname,
+        skinId: owner.skinId || "skin_default",
+        x: (Number(owner.x) || 0) + Math.cos(angle) * 38,
+        y: (Number(owner.y) || 0) + Math.sin(angle) * 38,
+        vx: Math.cos(angle) * TAG_CLONE_SPEED,
+        vy: Math.sin(angle) * TAG_CLONE_SPEED,
+        until: now + TAG_CLONE_MS,
+      });
+    }
+  }
+
+  function spawnTagSentinel(room, owner, now) {
+    room.tagSentinels = Array.isArray(room.tagSentinels) ? room.tagSentinels : [];
+    const sentinel = {
+      id: `${owner.userId}:sentinel:${now}`,
+      ownerId: owner.userId,
+      nickname: "경찰 AI",
+      skinId: "skin_default",
+      x: TAG_PRISON.x,
+      y: TAG_PRISON.y,
+      vx: 0,
+      vy: 0,
+      until: now + TAG_SENTINEL_MS,
+    };
+    room.tagSentinels.push(sentinel);
+    return sentinel;
+  }
+
+  function updateTagItemEntities(room, now) {
+    room.tagClones = (room.tagClones || []).filter((clone) => (clone.until || 0) > now).map((clone) => ({
+      ...clone,
+      x: (Number(clone.x) || 0) + (Number(clone.vx) || 0) * POSITION_SYNC_MS / 1000,
+      y: (Number(clone.y) || 0) + (Number(clone.vy) || 0) * POSITION_SYNC_MS / 1000,
+    }));
+    updateTagSpeedOrbs(room, now);
+    updateTagSentinels(room, now);
+  }
+
+  function updateTagSpeedOrbs(room, now) {
+    room.tagSpeedOrbs = (room.tagSpeedOrbs || []).filter((orb) => (orb.until || 0) > now);
+    for (const player of room.players.values()) {
+      if (player.status !== "runner" || (player.speedPointModeUntil || 0) <= now) continue;
+      if ((player.nextSpeedOrbAt || 0) <= now) {
+        const angle = Math.random() * Math.PI * 2;
+        const dist = 90 + Math.random() * 85;
+        room.tagSpeedOrbs.push({
+          id: `${player.userId}:speed:${now}`,
+          ownerId: player.userId,
+          x: (Number(player.x) || 0) + Math.cos(angle) * dist,
+          y: (Number(player.y) || 0) + Math.sin(angle) * dist,
+          until: now + TAG_SPEED_ORB_MS,
+        });
+        player.nextSpeedOrbAt = now + TAG_SPEED_ORB_SPAWN_MS;
+      }
+      for (const orb of room.tagSpeedOrbs) {
+        if (orb.ownerId !== player.userId) continue;
+        if (distancePoint(player, orb) <= TAG_SPEED_ORB_RADIUS + 18) {
+          orb.until = 0;
+          player.runnerSpeedUntil = Math.max(player.runnerSpeedUntil || 0, now + TAG_SPEED_PICKUP_MS);
+          player.runnerSpeedStacks = 1;
+          broadcastRoom(room, "tag_event", { type: "speed_orb_collected", user_id: player.userId, until: player.runnerSpeedUntil, room: serializeRoom(room) });
+        }
+      }
+    }
+    room.tagSpeedOrbs = room.tagSpeedOrbs.filter((orb) => (orb.until || 0) > now);
+  }
+
+  function updateTagSentinels(room, now) {
+    const sentinels = [];
+    for (const sentinel of room.tagSentinels || []) {
+      if ((sentinel.until || 0) <= now) continue;
+      const target = nearestActiveRunner(room, sentinel, now);
+      if (target) {
+        const dx = (Number(target.x) || 0) - (Number(sentinel.x) || 0);
+        const dy = (Number(target.y) || 0) - (Number(sentinel.y) || 0);
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist <= TAG_SENTINEL_TOUCH_RADIUS) {
+          tagPlayer(room, { ...sentinel, userId: sentinel.ownerId, role: "tagger", status: "tagger", tagCount: 0, nextTagAllowedUntil: 0 }, target, "sentinel");
+        } else if (dist > 0.001) {
+          sentinel.vx = dx / dist * TAG_SENTINEL_SPEED;
+          sentinel.vy = dy / dist * TAG_SENTINEL_SPEED;
+          sentinel.x = (Number(sentinel.x) || 0) + sentinel.vx * POSITION_SYNC_MS / 1000;
+          sentinel.y = (Number(sentinel.y) || 0) + sentinel.vy * POSITION_SYNC_MS / 1000;
+        }
+      }
+      sentinels.push(sentinel);
+    }
+    room.tagSentinels = sentinels;
+  }
+
+  function visibleSpeedOrbs(room) {
+    return (room.tagSpeedOrbs || []).filter((orb) => {
+      const owner = room.players.get(orb.ownerId);
+      return owner && (owner.speedPointModeUntil || 0) > Date.now();
+    });
+  }
+
   function setupBattleRoyale(room) {
     let index = 0;
     const total = Math.max(1, room.players.size);
@@ -1085,6 +1200,9 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     room.tagItemRoundStarted = false;
     room.prisonSentinel = {};
     room.tagRescue = { rescuerId: "", startedAt: 0, targetId: "" };
+    room.tagClones = [];
+    room.tagSentinels = [];
+    room.tagSpeedOrbs = [];
     for (const player of room.players.values()) resetPlayerForLobby(room, player, true);
     broadcastRoom(room, "room_updated", serializeRoom(room));
     updateFullRoomAutoStart(room);
@@ -1118,6 +1236,8 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     player.runnerSpeedUntil = 0;
     player.runnerSpeedStacks = 0;
     player.smokeUntil = 0;
+    player.speedPointModeUntil = 0;
+    player.nextSpeedOrbAt = 0;
     player.jailedAt = 0;
     player.rank = 0;
     player.hp = BR_INITIAL_HP;
@@ -1242,8 +1362,13 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     if (room.status !== "playing") return;
     const now = Date.now();
     if (room.mode === "tag") ensureTagItemRoundActive(room, now);
+    if (room.mode === "tag") updateTagItemEntities(room, now);
     const activeAt = room.mode === "tag" ? (room.tagActiveAt || room.startedAt) : room.startedAt;
     const elapsed = now - activeAt;
+    if (room.mode === "tag" && now >= activeAt + TAG_ROUND_MS) {
+      finishTagRoom(room, "time_up");
+      return;
+    }
     broadcastRoom(room, "positions_sync", {
       mode: room.mode,
       elapsed_ms: elapsed,
@@ -1251,6 +1376,9 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       tag_item_select_until: room.mode === "tag" ? (room.tagItemSelectUntil || 0) : 0,
       tag_active_at: room.mode === "tag" ? activeAt : 0,
       tag_prison_sentinel: room.mode === "tag" ? (room.prisonSentinel || {}) : {},
+      tag_clones: room.mode === "tag" ? (room.tagClones || []) : [],
+      tag_sentinels: room.mode === "tag" ? (room.tagSentinels || []) : [],
+      tag_speed_orbs: room.mode === "tag" ? visibleSpeedOrbs(room) : [],
       round_ends_at: room.mode === "tag" ? activeAt + TAG_ROUND_MS : 0,
       tag_prison: room.mode === "tag" ? TAG_PRISON : null,
       tag_prison_radius: room.mode === "tag" ? TAG_PRISON_RADIUS : 0,
@@ -1287,13 +1415,11 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
         runner_speed_until: player.runnerSpeedUntil || 0,
         runner_speed_stacks: player.runnerSpeedStacks || 0,
         smoke_until: player.smokeUntil || 0,
+        speed_point_mode_until: player.speedPointModeUntil || 0,
         jailed_at: player.jailedAt || 0,
       })),
     });
-    if (room.mode === "tag") {
-      updateTagRescue(room, now);
-      if (now >= activeAt + TAG_ROUND_MS) finishTagRoom(room, "time_up");
-    }
+    if (room.mode === "tag") updateTagRescue(room, now);
   }
 
   function makeRoom(mode, hostClient, maxPlayers, quick, tagVariant = "basic") {
@@ -1326,6 +1452,9 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       tagActiveAt: 0,
       tagItemRoundStarted: false,
       prisonSentinel: {},
+      tagClones: [],
+      tagSentinels: [],
+      tagSpeedOrbs: [],
     };
     rooms.set(code, room);
     return room;
