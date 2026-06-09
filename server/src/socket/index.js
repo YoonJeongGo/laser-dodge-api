@@ -1056,6 +1056,8 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     clearFullRoomAutoStart(room);
     room.status = "waiting";
     room.awaitingLobbyReturn = true;
+    room.quick = false;
+    room.quickMatchRoom = false;
     room.startedAt = 0;
     room.firstZombieDone = false;
     room.resultFinalized = false;
