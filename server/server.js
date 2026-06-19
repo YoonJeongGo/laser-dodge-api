@@ -13,6 +13,7 @@ const app = express();
 const httpServer = http.createServer(app);
 const databaseUrl = process.env.DATABASE_URL;
 const jwtSecret = process.env.JWT_SECRET;
+const refreshTokenSecret = process.env.REFRESH_TOKEN_SECRET || jwtSecret;
 
 if (!databaseUrl) throw new Error("DATABASE_URL is required");
 if (!jwtSecret) throw new Error("JWT_SECRET is required");
@@ -23,6 +24,18 @@ const pool = new pg.Pool({
 });
 const port = Number(process.env.PORT || 8787);
 const publicBaseUrl = process.env.PUBLIC_BASE_URL || "";
+const appVersion = process.env.APP_VERSION || "1.0.0";
+const serverCommit = process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || process.env.COMMIT_SHA || "local";
+const serverBuildId = process.env.RENDER_SERVICE_ID || process.env.BUILD_ID || "local";
+const multiplayerProtocol = "br-trace-v2";
+const appStartedAt = Date.now();
+const corsOrigins = String(process.env.CORS_ORIGIN || "")
+  .split(",")
+  .map((item) => item.trim())
+  .filter(Boolean);
+const rateLimitWindowMs = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
+const rateLimitMax = Number(process.env.RATE_LIMIT_MAX || 120);
+const rateLimitBuckets = new Map();
 const loginSessions = new Map();
 const oauthStates = new Map();
 const admobSsvKeyUrl = "https://gstatic.com/admob/reward/verifier-keys.json";
@@ -32,11 +45,42 @@ const devRewardVerificationEnabled =
   process.env.NODE_ENV === "development" ||
   process.env.NODE_ENV === "test";
 
-app.use(cors());
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
+app.use((req, res, next) => {
+  req.requestId = randomUUID();
+  res.setHeader("X-Request-Id", req.requestId);
+  next();
+});
+app.use(cors({
+  origin(origin, callback) {
+    if (corsOrigins.length === 0) return callback(null, true);
+    if (!origin || corsOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error("cors_origin_denied"));
+  },
+}));
 app.use(express.json({ limit: "64kb" }));
+app.use((req, res, next) => {
+  const now = Date.now();
+  const key = `${req.ip}:${req.path}`;
+  const bucket = rateLimitBuckets.get(key) || { count: 0, resetAt: now + rateLimitWindowMs };
+  if (bucket.resetAt <= now) {
+    bucket.count = 0;
+    bucket.resetAt = now + rateLimitWindowMs;
+  }
+  bucket.count += 1;
+  rateLimitBuckets.set(key, bucket);
+  if (bucket.count > rateLimitMax) {
+    return res.status(429).json({ error: "rate_limited", retry_after_ms: bucket.resetAt - now });
+  }
+  next();
+});
 
 const io = new SocketIOServer(httpServer, {
-  cors: { origin: "*", methods: ["GET", "POST"] },
+  cors: {
+    origin: corsOrigins.length === 0 ? true : corsOrigins,
+    methods: ["GET", "POST"],
+  },
 });
 const onlineUserIds = new Set();
 const realtimeRooms = new Map();
@@ -153,6 +197,7 @@ const DEFAULT_OWNED = ["skin_default", "trail_none", "death_default", "shield_de
 const DEFAULT_EQUIPPED = { skin: "skin_default", trail: "trail_none", death: "death_default", shield: "shield_default", background: "bg_void" };
 const ATTENDANCE_BASE_COINS = 20;
 const ATTENDANCE_WEEKLY_BONUS_COINS = 50;
+const ADMIN_USERNAMES = String(process.env.ADMIN_USERNAMES || "admin").split(",").map((item) => item.trim()).filter(Boolean);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -244,6 +289,26 @@ function requireAuth(req, res) {
   return payload;
 }
 
+async function requireAdmin(req, res) {
+  const configuredSecret = process.env.ADMIN_SECRET || "";
+  const providedSecret = String(req.headers["x-admin-secret"] || "");
+  const payload = bearerToken(req) ? verifyAuthToken(bearerToken(req)) : null;
+  if (configuredSecret && timingSafeStringEqual(providedSecret, configuredSecret)) {
+    return payload || { sub: null, username: "admin_secret" };
+  }
+  if (!payload) {
+    res.status(401).json({ error: "missing_admin_auth" });
+    return null;
+  }
+  const result = await pool.query("SELECT username FROM users WHERE id = $1", [payload.sub]);
+  const username = String(result.rows[0]?.username || payload.username || "");
+  if (!ADMIN_USERNAMES.includes(username)) {
+    res.status(403).json({ error: "admin_required" });
+    return null;
+  }
+  return payload;
+}
+
 async function addCoins(userId, amount, reason, refId = null) {
   const client = await pool.connect();
   try {
@@ -281,12 +346,59 @@ app.get("/", (_req, res) => {
     name: "Laser Dodge API",
     ok: true,
     health: "/health",
-    version: "1.0.0",
+    version: appVersion,
+    server_version: appVersion,
+    commit: serverCommit,
+    started_at: new Date(appStartedAt).toISOString(),
+    multiplayer_protocol: multiplayerProtocol,
   });
 });
 
 app.get("/health", async (_req, res) => {
   await pool.query("SELECT 1");
+  res.json({
+    ok: true,
+    server: "ok",
+    db: "ok",
+    version: appVersion,
+    server_version: appVersion,
+    commit: serverCommit,
+    build_id: serverBuildId,
+    started_at: new Date(appStartedAt).toISOString(),
+    multiplayer_protocol: multiplayerProtocol,
+    uptime: Math.floor((Date.now() - appStartedAt) / 1000),
+  });
+});
+
+app.get("/app/status", async (_req, res) => {
+  const maintenance = await pool.query(
+    "SELECT maintenance, message FROM maintenance_status ORDER BY updated_at DESC LIMIT 1",
+  );
+  const version = await pool.query(
+    "SELECT min_supported_version, latest_version, force_update, notes FROM app_versions WHERE platform = 'android' ORDER BY created_at DESC LIMIT 1",
+  );
+  const maintenanceRow = maintenance.rows[0] || {};
+  const versionRow = version.rows[0] || {};
+  res.json({
+    maintenance: Boolean(maintenanceRow.maintenance),
+    message: maintenanceRow.message || "",
+    min_supported_version: Number(versionRow.min_supported_version || 1),
+    latest_version: Number(versionRow.latest_version || 1),
+    force_update: Boolean(versionRow.force_update),
+    notes: versionRow.notes || "",
+  });
+});
+
+app.post("/client/error", async (req, res) => {
+  const payload = bearerToken(req) ? verifyAuthToken(bearerToken(req)) : null;
+  await recordErrorLog({
+    userId: payload?.sub || null,
+    level: cleanShortText(req.body.level || "error", 20),
+    source: "client",
+    message: cleanShortText(req.body.message || "client_error", 500),
+    details: req.body.details && typeof req.body.details === "object" ? req.body.details : {},
+    requestId: req.requestId,
+  });
   res.json({ ok: true });
 });
 
@@ -322,7 +434,7 @@ app.post("/users/guest", async (req, res) => {
     const user = result.rows[0];
     await ensureUserGameStats(user.id);
     await ensureUserEquipped(user.id);
-    res.json({ user, token: signAuthToken(user) });
+    res.json(await issueAuthResponse(user, req));
   } catch (error) {
     if (error.code === "23505") return res.status(409).json({ error: "nickname_taken" });
     throw error;
@@ -351,6 +463,9 @@ app.post("/auth/register", async (req, res) => {
   if (username.length < 4) return res.status(400).json({ error: "username_too_short" });
   if (password.length < 6) return res.status(400).json({ error: "password_too_short" });
   if (nickname.length < 2) return res.status(400).json({ error: "nickname_too_short" });
+  if (!cleanBool(req.body.terms_accepted) || !cleanBool(req.body.privacy_accepted)) {
+    return res.status(400).json({ error: "required_terms_missing" });
+  }
   try {
     const result = await pool.query(
       `INSERT INTO users (provider, provider_id, username, password_hash, nickname)
@@ -361,7 +476,13 @@ app.post("/auth/register", async (req, res) => {
     const user = result.rows[0];
     await ensureUserGameStats(user.id);
     await ensureUserEquipped(user.id);
-    res.json({ user, token: signAuthToken(user) });
+    await pool.query(
+      `INSERT INTO user_profiles (user_id, display_name, marketing_opt_in)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (user_id) DO UPDATE SET display_name = EXCLUDED.display_name, marketing_opt_in = EXCLUDED.marketing_opt_in, updated_at = now()`,
+      [user.id, nickname, cleanBool(req.body.marketing_opt_in)],
+    );
+    res.json(await issueAuthResponse(user, req));
   } catch (error) {
     if (error.code === "23505") {
       const field = String(error.constraint || "").includes("nickname") ? "nickname_taken" : "username_taken";
@@ -383,7 +504,33 @@ app.post("/auth/login", async (req, res) => {
   }
   const user = result.rows[0];
   const publicUser = { id: user.id, username: user.username, nickname: user.nickname, coin_balance: user.coin_balance };
-  res.json({ user: publicUser, token: signAuthToken(publicUser) });
+  res.json(await issueAuthResponse(publicUser, req));
+});
+
+app.post("/auth/refresh", async (req, res) => {
+  const refreshToken = String(req.body.refresh_token || "").trim();
+  const payload = verifyRefreshToken(refreshToken);
+  if (!payload) return res.status(401).json({ error: "invalid_refresh_token" });
+  const tokenHash = hashRefreshToken(refreshToken);
+  const session = await pool.query(
+    `SELECT rt.user_id, u.username, u.nickname, u.coin_balance
+     FROM refresh_tokens rt
+     JOIN users u ON u.id = rt.user_id
+     WHERE rt.token_hash = $1 AND rt.revoked_at IS NULL AND rt.expires_at > now()`,
+    [tokenHash],
+  );
+  if (session.rowCount === 0) return res.status(401).json({ error: "invalid_refresh_token" });
+  const user = session.rows[0];
+  const publicUser = { id: user.user_id, username: user.username, nickname: user.nickname, coin_balance: user.coin_balance };
+  res.json({ user: publicUser, token: signAuthToken(publicUser), refresh_token: refreshToken });
+});
+
+app.post("/auth/logout", async (req, res) => {
+  const refreshToken = String(req.body.refresh_token || "").trim();
+  if (refreshToken) {
+    await pool.query("UPDATE refresh_tokens SET revoked_at = now() WHERE token_hash = $1", [hashRefreshToken(refreshToken)]);
+  }
+  res.json({ logged_out: true });
 });
 
 app.get("/auth/me", async (req, res) => {
@@ -719,6 +866,123 @@ app.get("/friends/ranking", async (req, res) => {
     [payload.sub, mode, limit],
   );
   res.json({ records: result.rows, scope: "friends", mode });
+});
+
+// ─── Moderation and Admin ─────────────────────────────────────────────────────
+
+app.post("/v1/reports", async (req, res) => {
+  const payload = requireAuth(req, res);
+  if (!payload) return;
+  const reportedUserId = String(req.body.reported_user_id || req.body.user_id || "").trim();
+  const reason = cleanShortText(req.body.reason || "unspecified", 80);
+  const details = cleanShortText(req.body.details || "", 1000);
+  if (!reportedUserId) return res.status(400).json({ error: "reported_user_required" });
+  const result = await pool.query(
+    `INSERT INTO reports (reporter_id, reported_user_id, reason, details)
+     VALUES ($1, $2, $3, $4)
+     RETURNING id, status, created_at`,
+    [payload.sub, reportedUserId, reason, details],
+  );
+  await recordAuditLog({ userId: payload.sub, action: "report_user", targetType: "user", targetId: reportedUserId, details: { reason }, requestId: req.requestId });
+  res.json({ report: result.rows[0] });
+});
+
+app.post("/v1/blocks", async (req, res) => {
+  const payload = requireAuth(req, res);
+  if (!payload) return;
+  const blockedUserId = String(req.body.blocked_user_id || req.body.user_id || "").trim();
+  if (!blockedUserId || blockedUserId === payload.sub) return res.status(400).json({ error: "blocked_user_required" });
+  await pool.query(
+    `INSERT INTO blocks (blocker_id, blocked_user_id)
+     VALUES ($1, $2)
+     ON CONFLICT DO NOTHING`,
+    [payload.sub, blockedUserId],
+  );
+  await pool.query(
+    "DELETE FROM friendships WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $2 AND friend_id = $1)",
+    [payload.sub, blockedUserId],
+  );
+  await recordAuditLog({ userId: payload.sub, action: "block_user", targetType: "user", targetId: blockedUserId, requestId: req.requestId });
+  res.json({ blocked: true });
+});
+
+app.delete("/v1/blocks/:userId", async (req, res) => {
+  const payload = requireAuth(req, res);
+  if (!payload) return;
+  await pool.query("DELETE FROM blocks WHERE blocker_id = $1 AND blocked_user_id = $2", [payload.sub, req.params.userId]);
+  res.json({ blocked: false });
+});
+
+app.get("/admin/users", async (req, res) => {
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
+  const q = cleanShortText(req.query.q || "", 80);
+  const result = await pool.query(
+    `SELECT id, username, nickname, provider, coin_balance, created_at
+     FROM users
+     WHERE $1 = '' OR username ILIKE '%' || $1 || '%' OR nickname ILIKE '%' || $1 || '%'
+     ORDER BY created_at DESC
+     LIMIT 100`,
+    [q],
+  );
+  res.json({ users: result.rows });
+});
+
+app.get("/admin/reports", async (req, res) => {
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
+  const result = await pool.query("SELECT * FROM reports ORDER BY created_at DESC LIMIT 100");
+  res.json({ reports: result.rows });
+});
+
+app.post("/admin/wallet/adjust", async (req, res) => {
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
+  const userId = String(req.body.user_id || "").trim();
+  const amount = cleanInt(req.body.amount, 0);
+  const reason = cleanShortText(req.body.reason || "admin_adjust", 120);
+  if (!userId || amount === 0) return res.status(400).json({ error: "user_and_amount_required" });
+  const idempotencyKey = `admin:${admin.sub}:${userId}:${req.requestId}`;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const update = await client.query(
+      "UPDATE users SET coin_balance = coin_balance + $1 WHERE id = $2 AND coin_balance + $1 >= 0 RETURNING coin_balance",
+      [amount, userId],
+    );
+    if (update.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "invalid_wallet_adjustment" });
+    }
+    await client.query(
+      "INSERT INTO coin_transactions (user_id, amount, reason, ref_id) VALUES ($1, $2, $3, $4)",
+      [userId, amount, "admin_adjust", idempotencyKey],
+    );
+    await client.query(
+      "INSERT INTO admin_actions (admin_user_id, action, target_type, target_id, details) VALUES ($1, $2, $3, $4, $5)",
+      [admin.sub, "wallet_adjust", "user", userId, JSON.stringify({ amount, reason })],
+    );
+    await client.query("COMMIT");
+    res.json({ balance: update.rows[0].coin_balance });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/admin/app/status", async (req, res) => {
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
+  const maintenance = cleanBool(req.body.maintenance);
+  const message = cleanShortText(req.body.message || "", 300);
+  await pool.query("INSERT INTO maintenance_status (maintenance, message) VALUES ($1, $2)", [maintenance, message]);
+  await pool.query(
+    "INSERT INTO admin_actions (admin_user_id, action, target_type, target_id, details) VALUES ($1, 'set_maintenance', 'app', 'status', $2)",
+    [admin.sub, JSON.stringify({ maintenance, message })],
+  );
+  res.json({ maintenance, message });
 });
 
 // ─── Multiplayer Rooms (REST fallback for Socket.io migration) ────────────────
@@ -1315,6 +1579,7 @@ io.on("connection", (socket) => {
         host_id: socket.data.userId,
         max_players: maxPlayers,
         status: "waiting",
+        private: Boolean(data?.private),
         players: new Map(),
         created_at: Date.now(),
       };
@@ -1345,6 +1610,16 @@ io.on("connection", (socket) => {
     const player = room.players.get(socket.id);
     if (!player) return;
     player.ready = Boolean(data?.ready);
+    io.to(room.code).emit("room:state", serializeRealtimeRoom(room));
+  });
+
+  socket.on("room:set_private", (data, ack) => {
+    const room = getSocketRoom(socket);
+    if (!room) return safeAck(ack, { ok: false, error: "room_not_found" });
+    if (room.host_id !== socket.data.userId) return safeAck(ack, { ok: false, error: "not_host" });
+    if (room.status !== "waiting") return safeAck(ack, { ok: false, error: "room_not_waiting" });
+    room.private = Boolean(data?.private);
+    safeAck(ack, { ok: true, room: serializeRealtimeRoom(room) });
     io.to(room.code).emit("room:state", serializeRealtimeRoom(room));
   });
 
@@ -1399,6 +1674,7 @@ io.on("connection", (socket) => {
     if (!zombie || zombie.role !== "zombie") return;
     const target = findRealtimePlayerByUserId(room, String(data?.target_user_id || ""));
     if (!target || target.role === "zombie") return;
+    if (realtimeDistance(zombie, target) > 30) return;
     target.role = "zombie";
     io.to(room.code).emit("zombie:infected", { user_id: target.user_id });
     checkZombieWin(room);
@@ -1495,6 +1771,7 @@ function serializeRealtimeRoom(room) {
     host_id: room.host_id,
     max_players: room.max_players,
     status: room.status,
+    private: Boolean(room.private),
     players: [...room.players.values()].map(p => ({
       user_id: p.user_id,
       nickname: p.nickname,
@@ -1538,8 +1815,14 @@ function checkZombieWin(room) {
   const survivors = [...room.players.values()].filter(p => p.role !== "zombie");
   if (survivors.length <= 1) {
     room.status = "finished";
-    io.to(room.code).emit("match:finished", { mode: room.mode, winner_user_ids: survivors.map(p => p.user_id), reason: survivors.length === 0 ? "zombie_team" : "last_survivor" });
+    io.to(room.code).emit("match:finished", { mode: room.mode, winner_user_ids: survivors.map(p => p.user_id), reason: survivors.length === 0 ? "zombie_win" : "survivor_win" });
   }
+}
+
+function realtimeDistance(a, b) {
+  const dx = (Number(a?.x) || 0) - (Number(b?.x) || 0);
+  const dy = (Number(a?.y) || 0) - (Number(b?.y) || 0);
+  return Math.sqrt(dx * dx + dy * dy);
 }
 
 async function saveMultiplayerResult(room, userId, data) {
@@ -1733,11 +2016,20 @@ function verifyPassword(password, storedHash) {
 }
 function signAuthToken(user) {
   const now = Math.floor(Date.now() / 1000);
-  const payload = { sub: String(user.id), username: String(user.username || ""), nickname: String(user.nickname || ""), iat: now, exp: now + 60 * 60 * 24 * 30 };
+  const payload = { sub: String(user.id), username: String(user.username || ""), nickname: String(user.nickname || ""), iat: now, exp: now + 60 * 15 };
   const header = { alg: "HS256", typ: "JWT" };
   const encodedHeader = base64UrlEncode(JSON.stringify(header));
   const encodedPayload = base64UrlEncode(JSON.stringify(payload));
   const signature = signJwtParts(encodedHeader, encodedPayload);
+  return `${encodedHeader}.${encodedPayload}.${signature}`;
+}
+function signRefreshToken(user) {
+  const now = Math.floor(Date.now() / 1000);
+  const payload = { sub: String(user.id), typ: "refresh", jti: randomUUID(), iat: now, exp: now + 60 * 60 * 24 * 30 };
+  const header = { alg: "HS256", typ: "JWT" };
+  const encodedHeader = base64UrlEncode(JSON.stringify(header));
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+  const signature = createHmac("sha256", refreshTokenSecret).update(`${encodedHeader}.${encodedPayload}`).digest("base64url");
   return `${encodedHeader}.${encodedPayload}.${signature}`;
 }
 function verifyAuthToken(token) {
@@ -1754,15 +2046,69 @@ function verifyAuthToken(token) {
     return payload;
   } catch { return null; }
 }
+function verifyRefreshToken(token) {
+  const parts = String(token || "").split(".");
+  if (parts.length !== 3) return null;
+  const [encodedHeader, encodedPayload, signature] = parts;
+  const expected = createHmac("sha256", refreshTokenSecret).update(`${encodedHeader}.${encodedPayload}`).digest("base64url");
+  if (!timingSafeStringEqual(signature, expected)) return null;
+  try {
+    const header = JSON.parse(base64UrlDecode(encodedHeader));
+    const payload = JSON.parse(base64UrlDecode(encodedPayload));
+    if (header.alg !== "HS256" || payload.typ !== "refresh") return null;
+    if (!payload.sub || Number(payload.exp || 0) < Math.floor(Date.now() / 1000)) return null;
+    return payload;
+  } catch { return null; }
+}
 function signJwtParts(encodedHeader, encodedPayload) {
   return createHmac("sha256", jwtSecret).update(`${encodedHeader}.${encodedPayload}`).digest("base64url");
 }
 function base64UrlEncode(value) { return Buffer.from(value).toString("base64url"); }
 function base64UrlDecode(value) { return Buffer.from(value, "base64url").toString("utf8"); }
+function hashRefreshToken(token) {
+  return createHmac("sha256", refreshTokenSecret).update(String(token || "")).digest("hex");
+}
 function timingSafeStringEqual(left, right) {
   const l = Buffer.from(String(left));
   const r = Buffer.from(String(right));
   return l.length === r.length && timingSafeEqual(l, r);
+}
+async function issueAuthResponse(user, req) {
+  const publicUser = {
+    id: user.id,
+    username: user.username || "",
+    nickname: user.nickname || "",
+    coin_balance: user.coin_balance || 0,
+  };
+  const token = signAuthToken(publicUser);
+  const refreshToken = signRefreshToken(publicUser);
+  const refreshPayload = verifyRefreshToken(refreshToken);
+  await pool.query(
+    `INSERT INTO refresh_tokens (user_id, token_hash, user_agent, ip_address, expires_at)
+     VALUES ($1, $2, $3, $4, to_timestamp($5))`,
+    [
+      publicUser.id,
+      hashRefreshToken(refreshToken),
+      cleanShortText(req.headers["user-agent"] || "", 250),
+      cleanShortText(req.ip || "", 80),
+      refreshPayload.exp,
+    ],
+  );
+  return { user: publicUser, token, access_token: token, refresh_token: refreshToken };
+}
+async function recordAuditLog({ userId = null, action, targetType = "", targetId = "", details = {}, requestId = "" }) {
+  await pool.query(
+    `INSERT INTO audit_logs (user_id, action, target_type, target_id, details, request_id)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [userId, cleanShortText(action, 80), cleanShortText(targetType, 80), cleanShortText(targetId, 120), JSON.stringify(details || {}), requestId],
+  );
+}
+async function recordErrorLog({ userId = null, level = "error", source = "server", message = "", details = {}, requestId = "" }) {
+  await pool.query(
+    `INSERT INTO error_logs (user_id, level, source, message, details, request_id)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [userId, cleanShortText(level, 20), cleanShortText(source, 40), cleanShortText(message, 500), JSON.stringify(details || {}), requestId],
+  );
 }
 async function verifyAdMobSsvRequest(req) {
   const originalUrl = req.originalUrl || "";
@@ -2068,6 +2414,320 @@ async function ensureSchema() {
   );
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_profiles (
+      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      display_name TEXT NOT NULL DEFAULT '',
+      marketing_opt_in BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      user_agent TEXT NOT NULL DEFAULT '',
+      ip_address TEXT NOT NULL DEFAULT '',
+      revoked_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      expires_at TIMESTAMPTZ NOT NULL
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS refresh_tokens (
+      id BIGSERIAL PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_hash TEXT NOT NULL UNIQUE,
+      user_agent TEXT NOT NULL DEFAULT '',
+      ip_address TEXT NOT NULL DEFAULT '',
+      revoked_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      expires_at TIMESTAMPTZ NOT NULL
+    )`);
+  await pool.query("CREATE INDEX IF NOT EXISTS refresh_tokens_user_idx ON refresh_tokens (user_id, revoked_at, expires_at)");
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_wallets (
+      user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      balance INTEGER NOT NULL DEFAULT 0 CHECK (balance >= 0),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS wallet_transactions (
+      id BIGSERIAL PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      amount INTEGER NOT NULL,
+      balance_after INTEGER NOT NULL CHECK (balance_after >= 0),
+      reason TEXT NOT NULL,
+      source_type TEXT NOT NULL DEFAULT '',
+      source_id TEXT NOT NULL DEFAULT '',
+      idempotency_key TEXT NOT NULL UNIQUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query("CREATE INDEX IF NOT EXISTS wallet_transactions_user_idx ON wallet_transactions (user_id, created_at DESC)");
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION mirror_coin_transaction_to_wallet()
+    RETURNS TRIGGER AS $$
+    DECLARE current_balance INTEGER;
+    BEGIN
+      SELECT coin_balance INTO current_balance FROM users WHERE id = NEW.user_id;
+      INSERT INTO user_wallets (user_id, balance)
+      VALUES (NEW.user_id, COALESCE(current_balance, 0))
+      ON CONFLICT (user_id) DO UPDATE SET balance = EXCLUDED.balance, updated_at = now();
+      INSERT INTO wallet_transactions (user_id, amount, balance_after, reason, source_type, source_id, idempotency_key, created_at)
+      VALUES (
+        NEW.user_id,
+        NEW.amount,
+        COALESCE(current_balance, 0),
+        NEW.reason,
+        NEW.reason,
+        COALESCE(NEW.ref_id, NEW.id::text),
+        NEW.user_id::text || ':' || NEW.reason || ':' || COALESCE(NEW.ref_id, NEW.id::text),
+        NEW.created_at
+      )
+      ON CONFLICT (idempotency_key) DO NOTHING;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql`);
+  await pool.query("DROP TRIGGER IF EXISTS coin_transactions_wallet_mirror ON coin_transactions");
+  await pool.query(`
+    CREATE TRIGGER coin_transactions_wallet_mirror
+    AFTER INSERT ON coin_transactions
+    FOR EACH ROW EXECUTE FUNCTION mirror_coin_transaction_to_wallet()`);
+  await pool.query(`
+    INSERT INTO user_wallets (user_id, balance)
+    SELECT id, coin_balance FROM users
+    ON CONFLICT (user_id) DO UPDATE SET balance = EXCLUDED.balance, updated_at = now()`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS reward_claims (
+      id BIGSERIAL PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      reward_type TEXT NOT NULL,
+      source_id TEXT NOT NULL DEFAULT '',
+      idempotency_key TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL DEFAULT 'granted',
+      reward_amount INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query("CREATE INDEX IF NOT EXISTS reward_claims_user_idx ON reward_claims (user_id, created_at DESC)");
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION mirror_coin_transaction_to_reward_claim()
+    RETURNS TRIGGER AS $$
+    BEGIN
+      IF NEW.amount > 0 AND NEW.reason IN ('ad_reward', 'attendance_reward', 'achievement_reward', 'daily_quest_reward', 'game_reward', 'zombie_result', 'tag_result', 'battle_royale_result') THEN
+        INSERT INTO reward_claims (user_id, reward_type, source_id, idempotency_key, status, reward_amount, created_at)
+        VALUES (
+          NEW.user_id,
+          NEW.reason,
+          COALESCE(NEW.ref_id, NEW.id::text),
+          NEW.user_id::text || ':' || NEW.reason || ':' || COALESCE(NEW.ref_id, NEW.id::text),
+          'granted',
+          NEW.amount,
+          NEW.created_at
+        )
+        ON CONFLICT (idempotency_key) DO NOTHING;
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql`);
+  await pool.query("DROP TRIGGER IF EXISTS coin_transactions_reward_claim_mirror ON coin_transactions");
+  await pool.query(`
+    CREATE TRIGGER coin_transactions_reward_claim_mirror
+    AFTER INSERT ON coin_transactions
+    FOR EACH ROW EXECUTE FUNCTION mirror_coin_transaction_to_reward_claim()`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS items (
+      id TEXT PRIMARY KEY,
+      category TEXT NOT NULL,
+      name TEXT NOT NULL,
+      price INTEGER NOT NULL DEFAULT 0
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_items (
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      item_id TEXT NOT NULL,
+      equipped BOOLEAN NOT NULL DEFAULT false,
+      acquired_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (user_id, item_id)
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_products (
+      id TEXT PRIMARY KEY,
+      item_id TEXT,
+      bundle_id TEXT,
+      price INTEGER NOT NULL DEFAULT 0,
+      active BOOLEAN NOT NULL DEFAULT true,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS purchases (
+      id BIGSERIAL PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      product_id TEXT NOT NULL,
+      amount INTEGER NOT NULL DEFAULT 0,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ad_rewards (
+      id BIGSERIAL PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      ad_session_id TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      reward_amount INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS ad_rewards_user_session_idx ON ad_rewards (user_id, ad_session_id)");
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS game_sessions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+      mode TEXT NOT NULL DEFAULT 'classic',
+      started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      ended_at TIMESTAMPTZ
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS game_results (
+      id BIGSERIAL PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      game_session_id UUID NOT NULL,
+      mode TEXT NOT NULL,
+      score INTEGER NOT NULL DEFAULT 0,
+      survival_time REAL NOT NULL DEFAULT 0,
+      suspicious BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (user_id, game_session_id)
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS leaderboards (
+      id BIGSERIAL PRIMARY KEY,
+      mode TEXT NOT NULL,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      score INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS achievements (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      reward INTEGER NOT NULL DEFAULT 0
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS attendance_logs (
+      id BIGSERIAL PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      attendance_date DATE NOT NULL,
+      reward_amount INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (user_id, attendance_date)
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS friend_requests (
+      id BIGSERIAL PRIMARY KEY,
+      from_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      to_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (from_user_id, to_user_id)
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS friends (
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      friend_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (user_id, friend_id)
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS reports (
+      id BIGSERIAL PRIMARY KEY,
+      reporter_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      reported_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      reason TEXT NOT NULL,
+      details TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'open',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS blocks (
+      blocker_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      blocked_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (blocker_id, blocked_user_id),
+      CHECK (blocker_id <> blocked_user_id)
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS moderation_actions (
+      id BIGSERIAL PRIMARY KEY,
+      admin_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      target_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      action TEXT NOT NULL,
+      reason TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS error_logs (
+      id BIGSERIAL PRIMARY KEY,
+      user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      level TEXT NOT NULL DEFAULT 'error',
+      source TEXT NOT NULL DEFAULT 'server',
+      message TEXT NOT NULL,
+      details JSONB NOT NULL DEFAULT '{}'::jsonb,
+      request_id TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id BIGSERIAL PRIMARY KEY,
+      user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      action TEXT NOT NULL,
+      target_type TEXT NOT NULL DEFAULT '',
+      target_id TEXT NOT NULL DEFAULT '',
+      details JSONB NOT NULL DEFAULT '{}'::jsonb,
+      request_id TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS admin_actions (
+      id BIGSERIAL PRIMARY KEY,
+      admin_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+      action TEXT NOT NULL,
+      target_type TEXT NOT NULL DEFAULT '',
+      target_id TEXT NOT NULL DEFAULT '',
+      details JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_versions (
+      id BIGSERIAL PRIMARY KEY,
+      platform TEXT NOT NULL DEFAULT 'android',
+      min_supported_version INTEGER NOT NULL DEFAULT 1,
+      latest_version INTEGER NOT NULL DEFAULT 1,
+      force_update BOOLEAN NOT NULL DEFAULT false,
+      notes TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS announcements (
+      id BIGSERIAL PRIMARY KEY,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      active BOOLEAN NOT NULL DEFAULT true,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS maintenance_status (
+      id BIGSERIAL PRIMARY KEY,
+      maintenance BOOLEAN NOT NULL DEFAULT false,
+      message TEXT NOT NULL DEFAULT '',
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+  await pool.query("INSERT INTO app_versions (platform) SELECT 'android' WHERE NOT EXISTS (SELECT 1 FROM app_versions WHERE platform = 'android')");
+  await pool.query("INSERT INTO maintenance_status (maintenance, message) SELECT false, '' WHERE NOT EXISTS (SELECT 1 FROM maintenance_status)");
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS ad_reward_sessions (
       session_token TEXT PRIMARY KEY,
       user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -2171,9 +2831,41 @@ async function ensureSchema() {
   await pool.query("CREATE INDEX IF NOT EXISTS zombie_results_user_idx ON zombie_results (user_id, played_at DESC)");
 }
 
+app.use(async (error, req, res, _next) => {
+  console.error(error);
+  try {
+    const payload = bearerToken(req) ? verifyAuthToken(bearerToken(req)) : null;
+    await recordErrorLog({
+      userId: payload?.sub || null,
+      level: "error",
+      source: "server",
+      message: error?.message || "server_error",
+      details: { path: req.path, method: req.method },
+      requestId: req.requestId || "",
+    });
+  } catch {
+    // Avoid masking the original server error.
+  }
+  res.status(error.statusCode || 500).json({ error: "server_error", request_id: req.requestId || "" });
+});
+
 await ensureSchema();
 
-attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken, makeRoomCode, onlineUserIds });
+attachZombieMultiplayer({
+  httpServer,
+  io,
+  pool,
+  verifyAuthToken,
+  makeRoomCode,
+  onlineUserIds,
+  serverInfo: {
+    server_version: appVersion,
+    commit: serverCommit,
+    build_id: serverBuildId,
+    started_at: new Date(appStartedAt).toISOString(),
+    multiplayer_protocol: multiplayerProtocol,
+  },
+});
 
 httpServer.listen(port, "0.0.0.0", () => {
   console.log(`Laser Dodge API v2 listening on http://0.0.0.0:${port}`);
