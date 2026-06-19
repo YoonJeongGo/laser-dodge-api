@@ -12,7 +12,8 @@ const ZOMBIE_ROLE_REVEAL_MS = 3_000;
 const ZOMBIE_MISSILE_ORB_SPAWN_MS = 2000;
 const ZOMBIE_MISSILE_ORB_LIFETIME_MS = 9000;
 const ZOMBIE_MISSILE_ORB_RADIUS = 170;
-const ZOMBIE_MISSILE_CHARGE_REQUIRED = 1;
+const ZOMBIE_MISSILE_PICKUP_RADIUS = 16;
+const ZOMBIE_MISSILE_CHARGE_REQUIRED = 2;
 const ZOMBIE_MISSILE_SLOW_MS = 2500;
 const ZOMBIE_MISSILE_EFFECT_MS = 720;
 const ZOMBIE_COIN_HARD_CAP = 40;
@@ -72,8 +73,9 @@ const BR_ZONE_DAMAGE_INTERVAL_MS = 1000;
 const BR_SPAWN_RADIUS = 900;
 const BR_ORB_SPAWN_MS = 1000;
 const BR_ORB_LIFETIME_MS = 14000;
-const BR_SHIELD_CHARGE_REQUIRED = 5;
-const BR_ORB_PICKUP_RADIUS = 240;
+const BR_SHIELD_CHARGE_REQUIRED = 3;
+const BR_MISSILE_CHARGE_REQUIRED = 2;
+const BR_ORB_PICKUP_RADIUS = 16;
 const BR_HOMING_SPEED = 520;
 const BR_HOMING_LIFETIME_MS = 3000;
 const BR_HOMING_MAX_DISTANCE = 1200;
@@ -671,7 +673,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       : null;
     const serverDistance = distancePoint(player, orb);
     const clientDistance = clientPoint ? distancePoint(clientPoint, orb) : Infinity;
-    const touchRadius = Number(data.pickup_radius) > 0 ? Math.min(ZOMBIE_MISSILE_ORB_RADIUS, Number(data.pickup_radius)) : ZOMBIE_MISSILE_ORB_RADIUS;
+    const touchRadius = ZOMBIE_MISSILE_PICKUP_RADIUS;
     if (Math.min(serverDistance, clientDistance) > touchRadius) return;
     orbs.splice(index, 1);
     room.zombieMissileOrbs = orbs;
@@ -1505,6 +1507,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       player.role = "alive";
       player.shield = false;
       player.brShieldCharge = 0;
+      player.brMissileCharge = 0;
       player.brEliminations = 0;
       player.brHomingHits = 0;
       player.eliminatedAt = 0;
@@ -1708,8 +1711,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       : null;
     const serverDistance = distancePoint(player, orb);
     const clientDistance = clientPoint ? distancePoint(clientPoint, orb) : Infinity;
-    const requestedRadius = Number(data.pickup_radius) > 0 ? Number(data.pickup_radius) : 0;
-    const touchRadius = Math.max(BR_ORB_PICKUP_RADIUS, Math.min(280, requestedRadius));
+    const touchRadius = BR_ORB_PICKUP_RADIUS;
     const bestDistance = Math.min(serverDistance, clientDistance);
     if (bestDistance > touchRadius) {
       logBattleRoyalePickupCheck(room, player, orb, bestDistance, touchRadius, "client_request", "too_far");
@@ -1746,15 +1748,23 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     orbs.splice(index, 1);
     room.brOrbs = orbs;
     const shieldBefore = Number(player.brShieldCharge) || 0;
+    const missileBefore = Number(player.brMissileCharge) || 0;
     if (kind === "M") {
-      const missile = createBattleRoyaleMissile(room, player, now);
-      console.info(`[BR_ORB_COLLECTED] match=${room.matchId || ""} room=${room.code} user=${player.userId} orb=${collected.id} type=${kind} shield_before=${shieldBefore} shield_after=${player.brShieldCharge || 0} missile_spawned=${Boolean(missile)}`);
+      player.brMissileCharge = Math.min(BR_MISSILE_CHARGE_REQUIRED, missileBefore + 1);
+      const ready = player.brMissileCharge >= BR_MISSILE_CHARGE_REQUIRED;
+      const missile = ready ? createBattleRoyaleMissile(room, player, now) : null;
+      if (ready) player.brMissileCharge = 0;
+      console.info(`[BR_ORB_COLLECTED] match=${room.matchId || ""} room=${room.code} user=${player.userId} orb=${collected.id} type=${kind} missile_before=${missileBefore} missile_after=${player.brMissileCharge || 0} missile_required=${BR_MISSILE_CHARGE_REQUIRED} missile_spawned=${Boolean(missile)}`);
       broadcastRoom(room, "br_event", {
         type: "orb_collected",
         orb_id: collected.id,
         kind,
         user_id: player.userId,
         nickname: player.nickname,
+        missile_charge: player.brMissileCharge || 0,
+        missile_count: player.brMissileCharge || 0,
+        missile_required: BR_MISSILE_CHARGE_REQUIRED,
+        missile_max: BR_MISSILE_CHARGE_REQUIRED,
         missile,
         target_user_id: missile ? missile.current_target_user_id : "",
         room: serializeRoom(room),
@@ -2217,6 +2227,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     player.facingAngle = 0;
     player.shield = false;
     player.brShieldCharge = 0;
+    player.brMissileCharge = 0;
     player.brEliminations = 0;
     player.brHomingHits = 0;
     player.survivedMs = 0;
@@ -2456,6 +2467,8 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
         shield: player.shield,
         br_shield_charge: player.brShieldCharge || 0,
         br_shield_required: BR_SHIELD_CHARGE_REQUIRED,
+        br_missile_charge: player.brMissileCharge || 0,
+        br_missile_required: BR_MISSILE_CHARGE_REQUIRED,
         shield_count: player.brShieldCharge || 0,
         shield_max: BR_SHIELD_CHARGE_REQUIRED,
         shield_active: Boolean(player.shield),
@@ -2861,6 +2874,8 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
         shield: player.shield,
         br_shield_charge: player.brShieldCharge || 0,
         br_shield_required: BR_SHIELD_CHARGE_REQUIRED,
+        br_missile_charge: player.brMissileCharge || 0,
+        br_missile_required: BR_MISSILE_CHARGE_REQUIRED,
         shield_count: player.brShieldCharge || 0,
         shield_max: BR_SHIELD_CHARGE_REQUIRED,
         shield_active: Boolean(player.shield),
@@ -2966,6 +2981,8 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       shield_count: player.brShieldCharge || 0,
       shield_max: BR_SHIELD_CHARGE_REQUIRED,
       shield_active: Boolean(player.shield),
+      missile_count: player.brMissileCharge || 0,
+      missile_max: BR_MISSILE_CHARGE_REQUIRED,
       eliminations: Math.max(0, Number(player.brEliminations) || 0),
       homing_hits: Math.max(0, Number(player.brHomingHits) || 0),
       eliminated_at: player.eliminatedAt || 0,
