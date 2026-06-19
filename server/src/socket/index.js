@@ -12,7 +12,7 @@ const ZOMBIE_ROLE_REVEAL_MS = 3_000;
 const ZOMBIE_MISSILE_ORB_SPAWN_MS = 2000;
 const ZOMBIE_MISSILE_ORB_LIFETIME_MS = 9000;
 const ZOMBIE_MISSILE_ORB_RADIUS = 170;
-const ZOMBIE_MISSILE_PICKUP_RADIUS = 16;
+const ZOMBIE_MISSILE_PICKUP_RADIUS = 34;
 const ZOMBIE_MISSILE_CHARGE_REQUIRED = 2;
 const ZOMBIE_MISSILE_SLOW_MS = 2500;
 const ZOMBIE_MISSILE_EFFECT_MS = 720;
@@ -66,6 +66,7 @@ const PLAYER_LEFT_REWARD_MIN_MS = 30_000;
 const BR_INITIAL_HP = 4;
 const BR_RECONNECT_GRACE_MS = 10_000;
 const BR_QUICK_START_WAIT_MS = 25_000;
+const BR_START_COUNTDOWN_MS = 4_000;
 const BR_INITIAL_ZONE_RADIUS = 1800;
 const BR_FINAL_ZONE_RADIUS = 260;
 const BR_ZONE_SHRINK_MS = 120_000;
@@ -75,7 +76,7 @@ const BR_ORB_SPAWN_MS = 1000;
 const BR_ORB_LIFETIME_MS = 14000;
 const BR_SHIELD_CHARGE_REQUIRED = 3;
 const BR_MISSILE_CHARGE_REQUIRED = 2;
-const BR_ORB_PICKUP_RADIUS = 16;
+const BR_ORB_PICKUP_RADIUS = 34;
 const BR_HOMING_SPEED = 520;
 const BR_HOMING_LIFETIME_MS = 3000;
 const BR_HOMING_MAX_DISTANCE = 1200;
@@ -414,7 +415,9 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     room.status = "playing";
     room.awaitingLobbyReturn = false;
     room.startedAt = Date.now();
-    room.activeAt = room.mode === "zombie" ? room.startedAt + ZOMBIE_ROLE_REVEAL_MS : room.startedAt;
+    room.activeAt = room.mode === "zombie"
+      ? room.startedAt + ZOMBIE_ROLE_REVEAL_MS
+      : (room.mode === "battle_royale" ? room.startedAt + BR_START_COUNTDOWN_MS : room.startedAt);
     room.roundEndsAt = room.mode === "zombie" ? room.activeAt + ZOMBIE_ROUND_MS : 0;
     room.roundId = (room.roundId || 0) + 1;
     room.matchId = makeMatchId(room);
@@ -799,11 +802,13 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
   function requestBattleRoyaleDamage(client, data = {}) {
     const room = getClientRoom(client);
     if (!room || room.status !== "playing" || room.mode !== "battle_royale") return;
+    const now = Date.now();
+    if (now < (Number(room.activeAt) || Number(room.startedAt) || now)) return;
     const player = room.players.get(client.userId);
     if (!player || player.status !== "alive") return;
     const reason = String(data.reason || "laser");
     if (reason !== "laser" && reason !== "hazard") return;
-    if (!isPlayerTouchingBattleRoyaleHazard(room, player, Date.now())) return;
+    if (!isPlayerTouchingBattleRoyaleHazard(room, player, now)) return;
     applyBattleRoyaleDamage(room, player, 1, "laser");
   }
 
@@ -1342,11 +1347,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     room.hazards = [];
     const now = Date.now();
     if (room.mode === "battle_royale") {
-      const firstHazard = createMultiplayerHazard(room, now);
-      const secondHazard = createMultiplayerHazard(room, now + 1);
-      if (firstHazard) room.hazards.push(firstHazard);
-      if (secondHazard) room.hazards.push(secondHazard);
-      room.nextHazardAt = now + 350;
+      room.nextHazardAt = Math.max(now, Number(room.activeAt) || now) + 350;
     } else {
       room.nextHazardAt = 0;
     }
@@ -1354,6 +1355,12 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
 
   function updateMultiplayerHazards(room, now) {
     if (!room || room.status !== "playing" || room.mode !== "battle_royale") return;
+    const activeAt = Number(room.activeAt) || Number(room.startedAt) || now;
+    if (now < activeAt) {
+      room.hazards = [];
+      room.nextHazardAt = activeAt + 350;
+      return;
+    }
     room.hazards = (room.hazards || []).filter((hazard) => (hazard.despawnAt || 0) > now);
     if ((room.nextHazardAt || 0) > now) return;
     const hazardLimit = battleRoyaleHazardLimit(room, now);
@@ -1368,7 +1375,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
   }
 
   function battleRoyaleHazardLimit(room, now) {
-    const elapsed = Math.max(0, now - (room.startedAt || now));
+    const elapsed = Math.max(0, now - (room.activeAt || room.startedAt || now));
     if (elapsed < 30_000) return 4;
     if (elapsed < 60_000) return 5;
     if (elapsed < 90_000) return 6;
@@ -1376,7 +1383,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
   }
 
   function battleRoyaleHazardWarningMs(room, now) {
-    const elapsed = Math.max(0, now - (room.startedAt || now));
+    const elapsed = Math.max(0, now - (room.activeAt || room.startedAt || now));
     if (elapsed < 30_000) return 800;
     if (elapsed < 60_000) return 720;
     if (elapsed < 90_000) return 660;
@@ -1519,12 +1526,21 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     }
     room.brOrbs = [];
     room.brMissiles = [];
-    room.nextBrOrbAt = now + 1200;
+    room.nextBrOrbAt = Math.max(now, Number(room.activeAt) || now) + 650;
   }
 
   function serverCheckBattleRoyale(room) {
     if (room.mode !== "battle_royale" || room.status !== "playing") return;
     const now = Date.now();
+    const activeAt = Number(room.activeAt) || Number(room.startedAt) || now;
+    if (now < activeAt) {
+      room.brOrbs = [];
+      room.brMissiles = [];
+      room.hazards = [];
+      room.nextBrOrbAt = activeAt + 650;
+      room.nextHazardAt = activeAt + 350;
+      return;
+    }
     updateBattleRoyaleOrbs(room, now);
     collectBattleRoyaleOrbsOnServerTick(room, now);
     updateBattleRoyaleMissiles(room, now);
@@ -2833,7 +2849,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       status: room.status,
       server_time: now,
       match_id: room.matchId || "",
-      round_started_at: room.mode === "zombie" ? (room.activeAt || 0) : (room.mode === "battle_royale" ? (room.startedAt || 0) : 0),
+      round_started_at: room.mode === "zombie" || room.mode === "battle_royale" ? (room.activeAt || 0) : 0,
       active_at: room.activeAt || 0,
       round_ends_at: room.roundEndsAt || 0,
       max_players: room.maxPlayers,
@@ -3147,7 +3163,8 @@ function clampAngle(angle) {
 }
 
 function battleRoyaleZone(room, now = Date.now()) {
-  const elapsed = Math.max(0, now - (Number(room.startedAt) || now));
+  const activeAt = Number(room.activeAt) || Number(room.startedAt) || now;
+  const elapsed = Math.max(0, now - activeAt);
   const t = Math.min(1, elapsed / BR_ZONE_SHRINK_MS);
   const radius = BR_INITIAL_ZONE_RADIUS + (BR_FINAL_ZONE_RADIUS - BR_INITIAL_ZONE_RADIUS) * t;
   let damage = 0;
@@ -3159,7 +3176,7 @@ function battleRoyaleZone(room, now = Date.now()) {
 
 function battleRoyaleSafeZonePayload(room, now = Date.now()) {
   const zone = battleRoyaleZone(room, now);
-  const startedAt = Number(room.startedAt) || now;
+  const startedAt = Number(room.activeAt) || Number(room.startedAt) || now;
   return {
     center_x: zone.center.x,
     center_y: zone.center.y,
