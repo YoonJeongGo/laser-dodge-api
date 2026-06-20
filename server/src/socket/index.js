@@ -1751,10 +1751,6 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     }).length;
   }
 
-  function battleRoyaleSafeZoneRatio(zone) {
-    return Math.max(0, Math.min(1, (Number(zone?.radius) || 0) / BR_INITIAL_ZONE_RADIUS));
-  }
-
   function multiplayerHazardCenter(room) {
     const alive = [...room.players.values()].filter((player) => player.status === "alive" || player.status === "survivor");
     if (alive.length === 0) return { x: 0, y: 0 };
@@ -3673,6 +3669,10 @@ function battleRoyaleZone(room, now = Date.now()) {
   else if (elapsed >= 60_000) damage = 1;
   else if (elapsed >= 30_000) damage = 1;
   return { center: { x: 0, y: 0 }, radius, damage };
+}
+
+function battleRoyaleSafeZoneRatio(zone) {
+  return Math.max(0, Math.min(1, (Number(zone?.radius) || 0) / BR_INITIAL_ZONE_RADIUS));
 }
 
 function battleRoyaleSafeZonePayload(room, now = Date.now()) {
