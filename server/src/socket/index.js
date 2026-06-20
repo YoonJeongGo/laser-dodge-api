@@ -66,7 +66,8 @@ const PLAYER_LEFT_REWARD_MIN_MS = 30_000;
 const BR_INITIAL_HP = 4;
 const BR_RECONNECT_GRACE_MS = 10_000;
 const BR_QUICK_START_WAIT_MS = 25_000;
-const BR_START_COUNTDOWN_MS = 3_000;
+const BR_START_TEXT_MS = 1_000;
+const BR_START_COUNTDOWN_MS = 3_000 + BR_START_TEXT_MS;
 const BR_INITIAL_ZONE_RADIUS = 1800;
 const BR_FINAL_ZONE_RADIUS = 260;
 const BR_ZONE_SHRINK_MS = 120_000;
@@ -89,6 +90,7 @@ const BR_COIN_HARD_CAP = 50;
 const MULTI_HAZARD_LIFETIME_MS = 6200;
 const MULTI_LASER_WARNING_MS = 800;
 const MULTI_HAZARD_MAX = 8;
+const BR_PROJECTILE_DAMAGE_GRACE_MS = 450;
 
 export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken, makeRoomCode, onlineUserIds = new Set(), serverInfo = {} }) {
   const rooms = new Map();
@@ -424,6 +426,10 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     room.eliminationSequence = 0;
     room.firstZombieDone = false;
     room.resultFinalized = false;
+    if (room.mode === "battle_royale") {
+      room.brIntroBlockedLogged = false;
+      console.info(`[BR_START_SCHEDULED] event=game_starting match=${room.matchId || ""} room=${room.code} startedAt=${room.startedAt} activeAt=${room.activeAt} countdownMs=${BR_START_COUNTDOWN_MS} startTextMs=${BR_START_TEXT_MS}`);
+    }
     for (const player of room.players.values()) {
       player.status = "alive";
       player.role = "survivor";
@@ -1359,7 +1365,15 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     if (now < activeAt) {
       room.hazards = [];
       room.nextHazardAt = activeAt + 350;
+      if (!room.brIntroBlockedLogged) {
+        room.brIntroBlockedLogged = true;
+        console.info(`[BR_HAZARD_BLOCKED] event=positions_sync match=${room.matchId || ""} room=${room.code} serverTime=${now} activeAt=${activeAt} reason=intro_countdown`);
+      }
       return;
+    }
+    if (room.brIntroBlockedLogged) {
+      room.brIntroBlockedLogged = false;
+      console.info(`[BR_HAZARD_RELEASED] event=positions_sync match=${room.matchId || ""} room=${room.code} serverTime=${now} activeAt=${activeAt} reason=intro_finished`);
     }
     room.hazards = (room.hazards || []).filter((hazard) => (hazard.despawnAt || 0) > now);
     if ((room.nextHazardAt || 0) > now) return;
@@ -1369,7 +1383,10 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     const spawnCount = Math.min(roomLeft, Math.random() < 0.55 ? 2 : 1);
     for (let index = 0; index < spawnCount; index += 1) {
       const hazard = createMultiplayerHazard(room, now + index);
-      if (hazard) room.hazards.push(hazard);
+      if (hazard) {
+        room.hazards.push(hazard);
+        console.info(`[BR_HAZARD_SPAWNED] event=positions_sync match=${room.matchId || ""} room=${room.code} hazard=${hazard.id || ""} kind=${hazard.kind || hazard.type || ""} serverTime=${now} spawnedAt=${hazard.spawned_at || 0} damageStartedAt=${hazard.damage_started_at || 0} activeAt=${activeAt}`);
+      }
     }
     room.nextHazardAt = now + 520 + Math.floor(Math.random() * 260);
   }
@@ -1452,9 +1469,10 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       start,
       dir: { x: dx / dist, y: dy / dist },
       speed,
+      warning_ms: BR_PROJECTILE_DAMAGE_GRACE_MS,
       spawned_at: now,
       warning_started_at: now,
-      damage_started_at: now,
+      damage_started_at: now + BR_PROJECTILE_DAMAGE_GRACE_MS,
       expires_at: now + MULTI_HAZARD_LIFETIME_MS,
       despawnAt: now + MULTI_HAZARD_LIFETIME_MS,
     };
@@ -1614,14 +1632,18 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
   function applyBattleRoyaleDamage(room, player, amount, reason, sourcePlayer = null) {
     if (!room || room.status !== "playing" || room.mode !== "battle_royale") return;
     if (!player || player.status !== "alive") return;
+    const beforeHp = Number(player.hp) || BR_INITIAL_HP;
     if (reason === "homing" && sourcePlayer && sourcePlayer.userId !== player.userId) {
       sourcePlayer.brHomingHits = (Number(sourcePlayer.brHomingHits) || 0) + 1;
     }
     if ((reason === "laser" || reason === "homing") && player.shield) {
       player.shield = false;
       player.brShieldCharge = 0;
+      console.info(`[BR_DAMAGE_BLOCKED] event=br_event match=${room.matchId || ""} room=${room.code} user=${player.userId} reason=${reason} beforeHp=${beforeHp} afterHp=${beforeHp} serverTime=${Date.now()} block=shield`);
       broadcastRoom(room, "br_event", {
         type: "shield_block",
+        match_id: room.matchId || "",
+        server_time: Date.now(),
         user_id: player.userId,
         hp: player.hp,
         shield_charge: 0,
@@ -1632,8 +1654,11 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       return;
     }
     player.hp = Math.max(0, (Number(player.hp) || BR_INITIAL_HP) - Math.max(1, amount));
+    console.info(`[BR_DAMAGE_APPLIED] event=br_event match=${room.matchId || ""} room=${room.code} user=${player.userId} reason=${reason} beforeHp=${beforeHp} afterHp=${player.hp} serverTime=${Date.now()} source=${sourcePlayer ? sourcePlayer.userId : ""}`);
     broadcastRoom(room, "br_event", {
       type: "damage",
+      match_id: room.matchId || "",
+      server_time: Date.now(),
       user_id: player.userId,
       hp: player.hp,
       reason,
@@ -2422,7 +2447,9 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     if (room.mode === "zombie") updateZombieMissileOrbs(room, now);
     updateMultiplayerHazards(room, now);
     if (room.mode === "battle_royale") serverCheckBattleRoyale(room);
-    const activeAt = room.mode === "tag" ? (room.tagActiveAt || room.startedAt) : (room.mode === "zombie" ? (room.activeAt || room.startedAt) : room.startedAt);
+    const activeAt = room.mode === "tag"
+      ? (room.tagActiveAt || room.startedAt)
+      : (room.mode === "zombie" || room.mode === "battle_royale" ? (room.activeAt || room.startedAt) : room.startedAt);
     const elapsed = now - activeAt;
     if (room.mode === "tag" && now >= activeAt + TAG_ROUND_MS) {
       finishTagRoom(room, "time_up");
@@ -2807,14 +2834,16 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
   function battleRoyaleSnapshotPayload(room, syncPayload, now, elapsed) {
     const players = Array.isArray(syncPayload.players) ? syncPayload.players : [];
     const remaining = players.filter((player) => String(player.status || "") === "alive").length;
+    const activeAt = Number(room.activeAt) || Number(room.startedAt) || 0;
     return {
       type: "snapshot",
       mode: "battle_royale",
       match_id: room.matchId || "",
       server_time: now,
       round_elapsed_ms: elapsed,
-      round_started_at: room.startedAt || 0,
-      round_ends_at: (room.startedAt || 0) + BR_ZONE_SHRINK_MS,
+      round_started_at: activeAt,
+      active_at: activeAt,
+      round_ends_at: activeAt + BR_ZONE_SHRINK_MS,
       safe_zone: syncPayload.safe_zone || battleRoyaleSafeZonePayload(room, now),
       players,
       orbs: room.brOrbs || [],
