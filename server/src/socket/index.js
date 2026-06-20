@@ -90,7 +90,50 @@ const BR_COIN_HARD_CAP = 50;
 const MULTI_HAZARD_LIFETIME_MS = 6200;
 const MULTI_LASER_WARNING_MS = 800;
 const MULTI_HAZARD_MAX = 8;
-const BR_PROJECTILE_DAMAGE_GRACE_MS = 450;
+const BR_HAZARD_BALANCE = {
+  introGraceMs: 5000,
+  laser: {
+    warningMs: 900,
+    damageVisualLeadMs: 250,
+    minCooldownMs: 650,
+  },
+  arrow: {
+    visualLeadMs: 650,
+    minSpawnAfterActiveMs: 5000,
+    speedMultiplier: 0.95,
+    minCooldownMs: 750,
+  },
+  syncedHoming: {
+    visualLeadMs: 850,
+    minSpawnAfterActiveMs: 20000,
+    cooldownMs: 9000,
+    maxActive: 1,
+  },
+  greenMeteor: {
+    enabled: true,
+    allowedAfterMatchMs: 8000,
+    stopSafeZoneRatio: 0.55,
+    spawnSafeZoneRatioMin: 0.58,
+    cooldownMs: 12000,
+    maxActive: 1,
+    warningMs: 800,
+    parentVisualLeadMs: 700,
+    parentTravelMsMin: 1100,
+    parentTravelMsMax: 1400,
+    shardVisualLeadMs: 600,
+    shardLifetimeMs: 1600,
+    shardCount: 8,
+    shardSpeedMultiplierOfArrow: 0.7,
+    shardRadiusMultiplierOfArrow: 0.85,
+    blockNearSafeZoneShrinkMs: 700,
+    blockNearSyncedHomingMs: 2000,
+  },
+};
+const BR_PROJECTILE_DAMAGE_GRACE_MS = BR_HAZARD_BALANCE.arrow.visualLeadMs;
+const BR_ARROW_SPEED = 360 * BR_HAZARD_BALANCE.arrow.speedMultiplier;
+const BR_SYNCED_HOMING_SPEED = 430;
+const BR_GREEN_METEOR_PARENT_RADIUS = 42;
+const BR_GREEN_METEOR_SHARD_RADIUS = Math.round(BR_PROJECTILE_HIT_RADIUS * BR_HAZARD_BALANCE.greenMeteor.shardRadiusMultiplierOfArrow);
 
 export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken, makeRoomCode, onlineUserIds = new Set(), serverInfo = {} }) {
   const rooms = new Map();
@@ -428,6 +471,10 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     room.resultFinalized = false;
     if (room.mode === "battle_royale") {
       room.brIntroBlockedLogged = false;
+      room.hazardSeq = 0;
+      room.lastGreenMeteorAt = 0;
+      room.lastSyncedHomingAt = 0;
+      room.lastSafeZoneDamageAt = 0;
       console.info(`[BR_START_SCHEDULED] event=game_starting match=${room.matchId || ""} room=${room.code} startedAt=${room.startedAt} activeAt=${room.activeAt} countdownMs=${BR_START_COUNTDOWN_MS} startTextMs=${BR_START_TEXT_MS}`);
     }
     for (const player of room.players.values()) {
@@ -808,14 +855,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
   function requestBattleRoyaleDamage(client, data = {}) {
     const room = getClientRoom(client);
     if (!room || room.status !== "playing" || room.mode !== "battle_royale") return;
-    const now = Date.now();
-    if (now < (Number(room.activeAt) || Number(room.startedAt) || now)) return;
-    const player = room.players.get(client.userId);
-    if (!player || player.status !== "alive") return;
-    const reason = String(data.reason || "laser");
-    if (reason !== "laser" && reason !== "hazard") return;
-    if (!isPlayerTouchingBattleRoyaleHazard(room, player, now)) return;
-    applyBattleRoyaleDamage(room, player, 1, "laser");
+    console.info(`[BR_DAMAGE_BLOCKED] matchId=${room.matchId || ""} roomCode=${room.code} playerId=${client.userId} hazardId=${String(data.hazardId || "")} hazardType=${String(data.hazardType || "")} reason=client_damage_legacy_blocked serverTime=${Date.now()} activeAt=${room.activeAt || 0} damageEnabledAt=0`);
   }
 
   function serverCheckInfections(room) {
@@ -1382,10 +1422,12 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     const roomLeft = Math.max(0, hazardLimit - room.hazards.length);
     const spawnCount = Math.min(roomLeft, Math.random() < 0.55 ? 2 : 1);
     for (let index = 0; index < spawnCount; index += 1) {
-      const hazard = createMultiplayerHazard(room, now + index);
-      if (hazard) {
+      const created = createMultiplayerHazard(room, now + index);
+      const hazards = Array.isArray(created) ? created : (created ? [created] : []);
+      for (const hazard of hazards) {
+        if (!hazard) continue;
         room.hazards.push(hazard);
-        console.info(`[BR_HAZARD_SPAWNED] event=positions_sync match=${room.matchId || ""} room=${room.code} hazard=${hazard.id || ""} kind=${hazard.kind || hazard.type || ""} serverTime=${now} spawnedAt=${hazard.spawned_at || 0} damageStartedAt=${hazard.damage_started_at || 0} activeAt=${activeAt}`);
+        console.info(`[BR_HAZARD_SPAWNED] matchId=${room.matchId || ""} roomCode=${room.code} hazardId=${hazard.id || ""} hazardType=${hazard.type || hazard.kind || ""} seq=${hazard.seq || 0} x=${Number(hazard.x || 0).toFixed(1)} y=${Number(hazard.y || 0).toFixed(1)} vx=${Number(hazard.vx || 0).toFixed(1)} vy=${Number(hazard.vy || 0).toFixed(1)} spawnedAt=${hazard.spawned_at || 0} damageEnabledAt=${hazard.damage_enabled_at || hazard.damage_started_at || 0} expiresAt=${hazard.expires_at || 0}`);
       }
     }
     room.nextHazardAt = now + 520 + Math.floor(Math.random() * 260);
@@ -1401,7 +1443,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
 
   function battleRoyaleHazardWarningMs(room, now) {
     const elapsed = Math.max(0, now - (room.activeAt || room.startedAt || now));
-    if (elapsed < 30_000) return 800;
+    if (elapsed < 30_000) return BR_HAZARD_BALANCE.laser.warningMs;
     if (elapsed < 60_000) return 720;
     if (elapsed < 90_000) return 660;
     return 580;
@@ -1410,40 +1452,115 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
   function createMultiplayerHazard(room, now) {
     const zone = battleRoyaleZone(room, now);
     const center = battleRoyaleHazardSpawnCenter(room, zone);
+    const selectedType = selectBattleRoyaleHazardType(room, now, zone);
+    if (!selectedType) return null;
+    if (selectedType === "green_meteor") return createGreenMeteorHazards(room, now, zone, center);
+    if (selectedType === "laser") return createBattleRoyaleLaserHazard(room, now, zone, center);
+    return createBattleRoyaleProjectileHazard(room, now, zone, center, selectedType);
+  }
+
+  function selectBattleRoyaleHazardType(room, now, zone) {
+    const activeAt = Number(room.activeAt) || Number(room.startedAt) || now;
+    const elapsed = Math.max(0, now - activeAt);
+    const safeZoneRatio = battleRoyaleSafeZoneRatio(zone);
+    const phase = battleRoyaleHazardPhase(elapsed, safeZoneRatio);
+    const weights = battleRoyaleHazardWeights(phase);
+    const allowed = { ...weights };
+    if (elapsed < BR_HAZARD_BALANCE.arrow.minSpawnAfterActiveMs) allowed.arrow = 0;
+    if (elapsed < BR_HAZARD_BALANCE.syncedHoming.minSpawnAfterActiveMs) allowed.synced_homing = 0;
+    if (countActiveHazards(room, "synced_homing", now) >= BR_HAZARD_BALANCE.syncedHoming.maxActive) allowed.synced_homing = 0;
+    if (now - (Number(room.lastSyncedHomingAt) || 0) < BR_HAZARD_BALANCE.syncedHoming.cooldownMs) allowed.synced_homing = 0;
+    const meteorBlock = greenMeteorBlockReason(room, now, zone);
+    if (meteorBlock) allowed.green_meteor = 0;
+    const selectedType = weightedHazardType(allowed);
+    console.info(`[BR_HAZARD_ROLL] matchId=${room.matchId || ""} roomCode=${room.code} serverTime=${now} elapsedMs=${elapsed} safeZoneRatio=${safeZoneRatio.toFixed(3)} phase=${phase} selectedType=${selectedType || "none"} weights=${JSON.stringify(allowed)}`);
+    if (weights.green_meteor > 0) {
+      console.info(`[BR_GREEN_METEOR_ROLL] matchId=${room.matchId || ""} roomCode=${room.code} serverTime=${now} elapsedMs=${elapsed} safeZoneRatio=${safeZoneRatio.toFixed(3)} selected=${selectedType === "green_meteor"} reason=${meteorBlock || "allowed"}`);
+    }
+    return selectedType;
+  }
+
+  function battleRoyaleHazardPhase(elapsed, safeZoneRatio) {
+    if (elapsed < BR_HAZARD_BALANCE.introGraceMs) return "phase0";
+    if (safeZoneRatio <= 0.55 || elapsed >= 45_000) return "phase3";
+    if (elapsed < 20_000) return "phase1";
+    return "phase2";
+  }
+
+  function battleRoyaleHazardWeights(phase) {
+    if (phase === "phase0") return { laser: 100, arrow: 0, synced_homing: 0, green_meteor: 0 };
+    if (phase === "phase1") return { laser: 58, arrow: 37, synced_homing: 0, green_meteor: 5 };
+    if (phase === "phase2") return { laser: 50, arrow: 40, synced_homing: 3, green_meteor: 7 };
+    return { laser: 45, arrow: 43, synced_homing: 12, green_meteor: 0 };
+  }
+
+  function weightedHazardType(weights) {
+    const entries = Object.entries(weights).filter(([, value]) => Number(value) > 0);
+    const total = entries.reduce((sum, [, value]) => sum + Number(value), 0);
+    if (total <= 0) return null;
+    let roll = Math.random() * total;
+    for (const [type, value] of entries) {
+      roll -= Number(value);
+      if (roll <= 0) return type;
+    }
+    return entries[entries.length - 1]?.[0] || null;
+  }
+
+  function nextBattleRoyaleHazardSeq(room) {
+    room.hazardSeq = (Number(room.hazardSeq) || 0) + 1;
+    return room.hazardSeq;
+  }
+
+  function createBattleRoyaleLaserHazard(room, now, zone, center) {
     const roll = Math.random();
     const warningMs = battleRoyaleHazardWarningMs(room, now);
-    if (roll < 0.38) {
-      const laserRoll = Math.random();
-      const type = laserRoll < 0.38 ? "LZ_H" : (laserRoll < 0.76 ? "LZ_V" : (laserRoll < 0.88 ? "LZ_D1" : "LZ_D2"));
-      const offsetLimit = Math.max(120, Math.min(760, zone.radius * 0.72));
-      const offset = (Math.random() - 0.5) * offsetLimit * 2;
-      let data;
-      if (type === "LZ_H") {
-        data = { type, from: { x: -99999, y: center.y + offset }, to: { x: 99999, y: center.y + offset } };
-      } else if (type === "LZ_V") {
-        data = { type, from: { x: center.x + offset, y: -99999 }, to: { x: center.x + offset, y: 99999 } };
-      } else {
-        const diagonal = type === "LZ_D1" ? 1 : -1;
-        data = {
-          type,
-          from: { x: center.x - 1600, y: center.y + offset - diagonal * 1600 },
-          to: { x: center.x + 1600, y: center.y + offset + diagonal * 1600 },
-        };
-      }
-      return {
-        id: `hz_${room.roundId || 0}_${now}_${Math.floor(Math.random() * 10000)}`,
-        kind: "laser",
-        type: "laser",
-        warning_ms: warningMs,
-        spawned_at: now,
-        warning_started_at: now,
-        damage_started_at: now + warningMs,
-        expires_at: now + warningMs + 700,
-        despawnAt: now + warningMs + 700,
-        data,
+    const type = roll < 0.38 ? "LZ_H" : (roll < 0.76 ? "LZ_V" : (roll < 0.88 ? "LZ_D1" : "LZ_D2"));
+    const offsetLimit = Math.max(120, Math.min(760, zone.radius * 0.72));
+    const offset = (Math.random() - 0.5) * offsetLimit * 2;
+    let data;
+    if (type === "LZ_H") {
+      data = { type, from: { x: -99999, y: center.y + offset }, to: { x: 99999, y: center.y + offset } };
+    } else if (type === "LZ_V") {
+      data = { type, from: { x: center.x + offset, y: -99999 }, to: { x: center.x + offset, y: 99999 } };
+    } else {
+      const diagonal = type === "LZ_D1" ? 1 : -1;
+      data = {
+        type,
+        from: { x: center.x - 1600, y: center.y + offset - diagonal * 1600 },
+        to: { x: center.x + 1600, y: center.y + offset + diagonal * 1600 },
       };
     }
-    const projectileKind = roll < 0.88 ? "arrow" : "synced_homing";
+    const seq = nextBattleRoyaleHazardSeq(room);
+    const hazard = {
+      id: `hz_${room.roundId || 0}_${seq}_${now}`,
+      seq,
+      kind: "laser",
+      type,
+      hazard_type: type,
+      warning_ms: warningMs,
+      spawned_at: now,
+      warning_started_at: now,
+      damage_enabled_at: now + warningMs,
+      damage_started_at: now + warningMs,
+      expires_at: now + warningMs + 700,
+      despawnAt: now + warningMs + 700,
+      radius: BR_LASER_HIT_RADIUS,
+      active_at: Number(room.activeAt) || 0,
+      data,
+      laser_line: { start: data.from, end: data.to, width: BR_LASER_HIT_RADIUS * 2 },
+      warning_line: { start: data.from, end: data.to, width: BR_LASER_HIT_RADIUS * 2 },
+      damage_line: { start: data.from, end: data.to, width: BR_LASER_HIT_RADIUS * 2 },
+      line_start_x: data.from.x,
+      line_start_y: data.from.y,
+      line_end_x: data.to.x,
+      line_end_y: data.to.y,
+      width: BR_LASER_HIT_RADIUS * 2,
+    };
+    console.info(`[BR_LASER_WARNING_SENT] matchId=${room.matchId || ""} hazardId=${hazard.id} hazardType=${type} warningStartedAt=${hazard.warning_started_at} damageEnabledAt=${hazard.damage_enabled_at} lineStart=${JSON.stringify(data.from)} lineEnd=${JSON.stringify(data.to)}`);
+    return hazard;
+  }
+
+  function createBattleRoyaleProjectileHazard(room, now, zone, center, projectileKind) {
     const side = Math.floor(Math.random() * 4);
     const spread = Math.max(260, Math.min(680, zone.radius * 0.9));
     let start = { x: center.x, y: center.y };
@@ -1460,22 +1577,167 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     const dx = aim.x - start.x;
     const dy = aim.y - start.y;
     const dist = Math.max(0.001, Math.sqrt(dx * dx + dy * dy));
-    const speed = projectileKind === "synced_homing" ? 430 : 360;
+    const speed = projectileKind === "synced_homing" ? BR_SYNCED_HOMING_SPEED : BR_ARROW_SPEED;
+    const visualLeadMs = projectileKind === "synced_homing" ? BR_HAZARD_BALANCE.syncedHoming.visualLeadMs : BR_HAZARD_BALANCE.arrow.visualLeadMs;
+    const seq = nextBattleRoyaleHazardSeq(room);
+    if (projectileKind === "synced_homing") room.lastSyncedHomingAt = now;
     return {
-      id: `hz_${room.roundId || 0}_${now}_${Math.floor(Math.random() * 10000)}`,
+      id: `hz_${room.roundId || 0}_${seq}_${now}`,
+      seq,
       kind: "projectile",
-      type: "projectile",
+      type: projectileKind,
+      hazard_type: projectileKind,
       projectile_kind: projectileKind,
       start,
+      x: start.x,
+      y: start.y,
       dir: { x: dx / dist, y: dy / dist },
+      vx: (dx / dist) * speed,
+      vy: (dy / dist) * speed,
       speed,
-      warning_ms: BR_PROJECTILE_DAMAGE_GRACE_MS,
+      radius: BR_PROJECTILE_HIT_RADIUS,
+      target_id: target?.userId || "",
+      turn_rate: projectileKind === "synced_homing" ? 0 : 0,
+      warning_ms: visualLeadMs,
       spawned_at: now,
       warning_started_at: now,
-      damage_started_at: now + BR_PROJECTILE_DAMAGE_GRACE_MS,
+      damage_enabled_at: now + visualLeadMs,
+      damage_started_at: now + visualLeadMs,
       expires_at: now + MULTI_HAZARD_LIFETIME_MS,
       despawnAt: now + MULTI_HAZARD_LIFETIME_MS,
+      active_at: Number(room.activeAt) || 0,
     };
+  }
+
+  function greenMeteorBlockReason(room, now, zone) {
+    const config = BR_HAZARD_BALANCE.greenMeteor;
+    if (!config.enabled) return "disabled";
+    const activeAt = Number(room.activeAt) || Number(room.startedAt) || now;
+    const elapsed = Math.max(0, now - activeAt);
+    const safeZoneRatio = battleRoyaleSafeZoneRatio(zone);
+    if (elapsed < config.allowedAfterMatchMs) return "intro_not_finished";
+    if (safeZoneRatio <= config.stopSafeZoneRatio || safeZoneRatio < config.spawnSafeZoneRatioMin) return "safe_zone_too_small";
+    const maxMeteorLife = config.parentTravelMsMax + config.shardLifetimeMs;
+    const predictedRatio = battleRoyaleSafeZoneRatio(battleRoyaleZone(room, now + maxMeteorLife + config.blockNearSafeZoneShrinkMs));
+    if (predictedRatio <= config.stopSafeZoneRatio) return "safe_zone_will_be_too_small";
+    if (countActiveHazards(room, "green_meteor", now) >= config.maxActive) return "max_active_green_meteor";
+    if (now - (Number(room.lastGreenMeteorAt) || 0) < config.cooldownMs) return "cooldown";
+    if (now - (Number(room.lastSyncedHomingAt) || 0) < config.blockNearSyncedHomingMs) return "near_synced_homing";
+    if (now - (Number(room.lastSafeZoneDamageAt) || 0) < config.blockNearSafeZoneShrinkMs) return "near_safe_zone_damage";
+    return "";
+  }
+
+  function createGreenMeteorHazards(room, now, zone, center) {
+    const blockReason = greenMeteorBlockReason(room, now, zone);
+    const safeZoneRatio = battleRoyaleSafeZoneRatio(zone);
+    if (blockReason) {
+      console.info(`[BR_GREEN_METEOR_SPAWN_BLOCKED] matchId=${room.matchId || ""} roomCode=${room.code} reason=${blockReason} safeZoneRatio=${safeZoneRatio.toFixed(3)} safeZoneRadius=${Number(zone.radius || 0).toFixed(1)} initialSafeZoneRadius=${BR_INITIAL_ZONE_RADIUS} safeZonePhase=${battleRoyaleHazardPhase(Math.max(0, now - (Number(room.activeAt) || now)), safeZoneRatio)} serverTime=${now}`);
+      return null;
+    }
+    const config = BR_HAZARD_BALANCE.greenMeteor;
+    const angle = Math.random() * Math.PI * 2;
+    const spawnDist = Math.max(520, Math.min(920, zone.radius * 0.82));
+    const spawn = clampPointToBattleRoyaleZone({
+      x: center.x + Math.cos(angle) * spawnDist,
+      y: center.y + Math.sin(angle) * spawnDist,
+    }, zone, 50);
+    const burst = clampPointToBattleRoyaleZone({
+      x: center.x + (Math.random() - 0.5) * Math.min(420, zone.radius * 0.45),
+      y: center.y + (Math.random() - 0.5) * Math.min(420, zone.radius * 0.45),
+    }, zone, 120);
+    const travelMs = config.parentTravelMsMin + Math.floor(Math.random() * (config.parentTravelMsMax - config.parentTravelMsMin + 1));
+    const dx = burst.x - spawn.x;
+    const dy = burst.y - spawn.y;
+    const parentSpawnedAt = now + config.warningMs;
+    const burstAt = parentSpawnedAt + travelMs;
+    const vx = dx / (travelMs / 1000);
+    const vy = dy / (travelMs / 1000);
+    const parentSeq = nextBattleRoyaleHazardSeq(room);
+    const parentId = `gm_${room.roundId || 0}_${parentSeq}_${now}`;
+    const childIds = [];
+    const shards = [];
+    const shardSpeed = BR_ARROW_SPEED * config.shardSpeedMultiplierOfArrow;
+    for (let index = 0; index < config.shardCount; index += 1) {
+      const shardSeq = nextBattleRoyaleHazardSeq(room);
+      const angleDeg = index * 45;
+      const rad = angleDeg * Math.PI / 180;
+      const shardId = `gms_${room.roundId || 0}_${shardSeq}_${now}`;
+      childIds.push(shardId);
+      shards.push({
+        id: shardId,
+        seq: shardSeq,
+        parent_id: parentId,
+        parentHazardId: parentId,
+        kind: "projectile",
+        type: "green_meteor_shard",
+        hazard_type: "green_meteor_shard",
+        projectile_kind: "green_meteor_shard",
+        x: burst.x,
+        y: burst.y,
+        start: { x: burst.x, y: burst.y },
+        dir: { x: Math.cos(rad), y: Math.sin(rad) },
+        vx: Math.cos(rad) * shardSpeed,
+        vy: Math.sin(rad) * shardSpeed,
+        speed: shardSpeed,
+        radius: BR_GREEN_METEOR_SHARD_RADIUS,
+        angle_deg: angleDeg,
+        spawned_at: burstAt,
+        warning_started_at: now,
+        damage_enabled_at: burstAt + config.shardVisualLeadMs,
+        damage_started_at: burstAt + config.shardVisualLeadMs,
+        expires_at: burstAt + config.shardLifetimeMs,
+        despawnAt: burstAt + config.shardLifetimeMs,
+        active_at: Number(room.activeAt) || 0,
+        server_time: now,
+      });
+    }
+    const parent = {
+      id: parentId,
+      seq: parentSeq,
+      matchId: room.matchId || "",
+      kind: "projectile",
+      type: "green_meteor",
+      hazard_type: "green_meteor",
+      projectile_kind: "green_meteor",
+      state: "incoming",
+      spawn_x: spawn.x,
+      spawn_y: spawn.y,
+      x: spawn.x,
+      y: spawn.y,
+      start: spawn,
+      dir: { x: dx / Math.max(1, Math.sqrt(dx * dx + dy * dy)), y: dy / Math.max(1, Math.sqrt(dx * dx + dy * dy)) },
+      vx,
+      vy,
+      speed: Math.sqrt(vx * vx + vy * vy),
+      radius: BR_GREEN_METEOR_PARENT_RADIUS,
+      burst_x: burst.x,
+      burst_y: burst.y,
+      warning_started_at: now,
+      spawned_at: parentSpawnedAt,
+      damage_enabled_at: parentSpawnedAt + config.parentVisualLeadMs,
+      damage_started_at: parentSpawnedAt + config.parentVisualLeadMs,
+      burst_at: burstAt,
+      expires_at: burstAt,
+      despawnAt: burstAt,
+      child_ids: childIds,
+      active_at: Number(room.activeAt) || 0,
+      server_time: now,
+    };
+    room.lastGreenMeteorAt = now;
+    console.info(`[BR_GREEN_METEOR_SPAWNED] matchId=${room.matchId || ""} roomCode=${room.code} hazardId=${parent.id} spawnX=${spawn.x.toFixed(1)} spawnY=${spawn.y.toFixed(1)} burstX=${burst.x.toFixed(1)} burstY=${burst.y.toFixed(1)} vx=${vx.toFixed(1)} vy=${vy.toFixed(1)} warningStartedAt=${parent.warning_started_at} spawnedAt=${parent.spawned_at} damageEnabledAt=${parent.damage_enabled_at} burstAt=${parent.burst_at} expiresAt=${parent.expires_at} childIds=${childIds.join(",")}`);
+    console.info(`[BR_GREEN_METEOR_SHARDS_SPAWNED] matchId=${room.matchId || ""} parentId=${parent.id} shardIds=${childIds.join(",")} shardAngles=0,45,90,135,180,225,270,315 shardSpeed=${shardSpeed.toFixed(1)} spawnedAt=${burstAt} damageEnabledAt=${burstAt + config.shardVisualLeadMs} expiresAt=${burstAt + config.shardLifetimeMs}`);
+    return [parent, ...shards];
+  }
+
+  function countActiveHazards(room, type, now) {
+    return (Array.isArray(room.hazards) ? room.hazards : []).filter((hazard) => {
+      if (!hazard || (Number(hazard.expires_at ?? hazard.despawnAt) || 0) <= now) return false;
+      return battleRoyaleHazardType(hazard) === type;
+    }).length;
+  }
+
+  function battleRoyaleSafeZoneRatio(zone) {
+    return Math.max(0, Math.min(1, (Number(zone?.radius) || 0) / BR_INITIAL_ZONE_RADIUS));
   }
 
   function multiplayerHazardCenter(room) {
@@ -1570,7 +1832,12 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       if (distancePoint(player, zone.center) <= zone.radius) continue;
       if (now - (player.lastZoneDamageAt || 0) < BR_ZONE_DAMAGE_INTERVAL_MS) continue;
       player.lastZoneDamageAt = now;
-      applyBattleRoyaleDamage(room, player, zone.damage, "zone");
+      room.lastSafeZoneDamageAt = now;
+      applyBattleRoyaleDamage(room, player, zone.damage, "safe_zone", null, {
+        serverTime: now,
+        safeZoneRatio: battleRoyaleSafeZoneRatio(zone),
+        playerDistanceFromCenter: distancePoint(player, zone.center),
+      });
     }
   }
 
@@ -1629,39 +1896,72 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     return best;
   }
 
-  function applyBattleRoyaleDamage(room, player, amount, reason, sourcePlayer = null) {
+  function applyBattleRoyaleDamage(room, player, amount, reason, sourcePlayer = null, context = {}) {
     if (!room || room.status !== "playing" || room.mode !== "battle_royale") return;
     if (!player || player.status !== "alive") return;
     const beforeHp = Number(player.hp) || BR_INITIAL_HP;
-    if (reason === "homing" && sourcePlayer && sourcePlayer.userId !== player.userId) {
+    const beforeShield = Boolean(player.shield);
+    const hazard = context.hazard || null;
+    const hazardId = String(context.hazardId || hazard?.id || "");
+    const hazardType = String(context.hazardType || (hazard ? battleRoyaleHazardType(hazard) : ""));
+    const serverTime = Number(context.serverTime) || Date.now();
+    if ((reason === "homing" || reason === "br_missile") && sourcePlayer && sourcePlayer.userId !== player.userId) {
       sourcePlayer.brHomingHits = (Number(sourcePlayer.brHomingHits) || 0) + 1;
     }
-    if ((reason === "laser" || reason === "homing") && player.shield) {
+    if (reason !== "safe_zone" && player.shield) {
       player.shield = false;
       player.brShieldCharge = 0;
-      console.info(`[BR_DAMAGE_BLOCKED] event=br_event match=${room.matchId || ""} room=${room.code} user=${player.userId} reason=${reason} beforeHp=${beforeHp} afterHp=${beforeHp} serverTime=${Date.now()} block=shield`);
+      console.info(`[BR_DAMAGE_BLOCKED] matchId=${room.matchId || ""} roomCode=${room.code} playerId=${player.userId} hazardId=${hazardId} hazardType=${hazardType} reason=shield serverTime=${serverTime} activeAt=${room.activeAt || 0} damageEnabledAt=${hazard ? (hazard.damage_enabled_at || hazard.damage_started_at || 0) : 0}`);
       broadcastRoom(room, "br_event", {
         type: "shield_block",
+        event: "br_damage",
         match_id: room.matchId || "",
-        server_time: Date.now(),
+        matchId: room.matchId || "",
+        roomCode: room.code,
+        server_time: serverTime,
         user_id: player.userId,
+        playerId: player.userId,
         hp: player.hp,
+        beforeHp,
+        afterHp: player.hp,
+        beforeShield,
+        afterShield: false,
         shield_charge: 0,
         shield_active: false,
         reason,
+        damageReason: reason,
+        hazardId,
+        hazardType,
+        parentHazardId: String(context.parentHazardId || hazard?.parent_id || ""),
+        hazard: hazard ? battleRoyaleDamageHazardPayload(hazard, serverTime) : null,
         room: serializeRoom(room),
       });
       return;
     }
     player.hp = Math.max(0, (Number(player.hp) || BR_INITIAL_HP) - Math.max(1, amount));
-    console.info(`[BR_DAMAGE_APPLIED] event=br_event match=${room.matchId || ""} room=${room.code} user=${player.userId} reason=${reason} beforeHp=${beforeHp} afterHp=${player.hp} serverTime=${Date.now()} source=${sourcePlayer ? sourcePlayer.userId : ""}`);
+    console.info(`[BR_DAMAGE_APPLIED] matchId=${room.matchId || ""} roomCode=${room.code} playerId=${player.userId} hazardId=${hazardId} hazardType=${hazardType} damageReason=${reason} beforeHp=${beforeHp} afterHp=${player.hp} beforeShield=${beforeShield} afterShield=${Boolean(player.shield)} serverTime=${serverTime}`);
     broadcastRoom(room, "br_event", {
       type: "damage",
+      event: "br_damage",
       match_id: room.matchId || "",
-      server_time: Date.now(),
+      matchId: room.matchId || "",
+      roomCode: room.code,
+      server_time: serverTime,
       user_id: player.userId,
+      playerId: player.userId,
       hp: player.hp,
+      beforeHp,
+      afterHp: player.hp,
+      beforeShield,
+      afterShield: Boolean(player.shield),
       reason,
+      damageReason: reason,
+      hazardId,
+      hazardType,
+      parentHazardId: String(context.parentHazardId || hazard?.parent_id || ""),
+      safeZoneRatio: context.safeZoneRatio,
+      playerDistanceFromCenter: context.playerDistanceFromCenter,
+      hazard: hazard ? battleRoyaleDamageHazardPayload(hazard, serverTime) : null,
       room: serializeRoom(room),
     });
     if (player.hp <= 0) eliminateBattleRoyalePlayer(room, player, reason, sourcePlayer);
@@ -1672,16 +1972,28 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     const hazards = Array.isArray(room.hazards) ? room.hazards : [];
     if (hazards.length === 0) return;
     for (const hazard of hazards) {
-      if (!isBattleRoyaleHazardDamageActive(hazard, now)) continue;
       const hazardId = String(hazard.id || "");
       if (!hazardId) continue;
+      const gate = battleRoyaleHazardDamageGate(room, hazard, now);
+      if (!gate.canDamage) {
+        console.info(`[BR_PROJECTILE_DAMAGE_GATE] matchId=${room.matchId || ""} hazardId=${hazardId} hazardType=${battleRoyaleHazardType(hazard)} serverTime=${now} spawnedAt=${hazard.spawned_at || 0} damageEnabledAt=${hazard.damage_enabled_at || hazard.damage_started_at || 0} canDamage=false reason=${gate.reason}`);
+        continue;
+      }
       for (const player of room.players.values()) {
         if (player.status !== "alive") continue;
         player.brHazardHits = player.brHazardHits || {};
         if (player.brHazardHits[hazardId]) continue;
-        if (!battleRoyaleHazardHitsPlayer(hazard, player, now)) continue;
+        const hit = battleRoyaleHazardHitDetails(hazard, player, now);
+        console.info(`[BR_DAMAGE_ATTEMPT] matchId=${room.matchId || ""} roomCode=${room.code} playerId=${player.userId} hazardId=${hazardId} hazardType=${battleRoyaleHazardType(hazard)} damageReason=${battleRoyaleDamageReasonForHazard(hazard)} serverTime=${now} damageEnabledAt=${hazard.damage_enabled_at || hazard.damage_started_at || 0} playerX=${Number(player.x || 0).toFixed(1)} playerY=${Number(player.y || 0).toFixed(1)} hazardX=${hit.hazardX.toFixed(1)} hazardY=${hit.hazardY.toFixed(1)} distance=${hit.distance.toFixed(1)} radius=${hit.radius.toFixed(1)}`);
+        if (!hit.hit) continue;
         player.brHazardHits[hazardId] = true;
-        applyBattleRoyaleDamage(room, player, 1, "laser");
+        applyBattleRoyaleDamage(room, player, 1, battleRoyaleDamageReasonForHazard(hazard), null, {
+          hazard,
+          hazardId,
+          hazardType: battleRoyaleHazardType(hazard),
+          parentHazardId: hazard.parent_id || "",
+          serverTime: now,
+        });
       }
     }
   }
@@ -1696,37 +2008,158 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
   }
 
   function isBattleRoyaleHazardDamageActive(hazard, now) {
-    const damageAt = Number(hazard.damage_started_at ?? hazard.damageStartedAt ?? hazard.spawned_at ?? 0);
+    const damageAt = Number(hazard.damage_enabled_at ?? hazard.damage_started_at ?? hazard.damageStartedAt ?? hazard.spawned_at ?? 0);
     const expiresAt = Number(hazard.expires_at ?? hazard.despawnAt ?? 0);
     return damageAt > 0 && expiresAt > 0 && now >= damageAt && now <= expiresAt;
   }
 
+  function battleRoyaleHazardDamageGate(room, hazard, now) {
+    const activeAt = Number(room.activeAt) || Number(room.startedAt) || now;
+    const damageAt = Number(hazard.damage_enabled_at ?? hazard.damage_started_at ?? hazard.spawned_at ?? 0);
+    const expiresAt = Number(hazard.expires_at ?? hazard.despawnAt ?? 0);
+    const type = battleRoyaleHazardType(hazard);
+    if (now < activeAt) return { canDamage: false, reason: "round_not_active" };
+    if (!String(hazard.id || "")) return { canDamage: false, reason: "missing_hazard_id" };
+    if (type === "green_meteor" && Number(hazard.burst_at || 0) > 0 && now >= Number(hazard.burst_at)) return { canDamage: false, reason: "green_meteor_burst_finished" };
+    if (damageAt <= 0 || now < damageAt) return { canDamage: false, reason: `${type || "hazard"}_warning_not_finished` };
+    if (expiresAt <= 0 || now > expiresAt) return { canDamage: false, reason: "expired" };
+    return { canDamage: true, reason: "ok" };
+  }
+
   function battleRoyaleHazardHitsPlayer(hazard, player, now) {
+    return battleRoyaleHazardHitDetails(hazard, player, now).hit;
+  }
+
+  function battleRoyaleHazardHitDetails(hazard, player, now) {
     const kind = String(hazard.kind || hazard.type || "");
+    const type = battleRoyaleHazardType(hazard);
     if (kind === "laser") {
       const data = hazard.data || {};
       const from = data.from || null;
       const to = data.to || null;
-      if (!from || !to) return false;
-      return distancePointToSegment(player, from, to) <= BR_LASER_HIT_RADIUS;
+      if (!from || !to) return { hit: false, hazardX: 0, hazardY: 0, distance: Infinity, radius: BR_LASER_HIT_RADIUS };
+      const distance = distancePointToSegment(player, from, to);
+      return { hit: distance <= BR_LASER_HIT_RADIUS, hazardX: Number(player.x) || 0, hazardY: Number(player.y) || 0, distance, radius: BR_LASER_HIT_RADIUS };
     }
-    if (kind === "projectile") {
+    if (kind === "projectile" || type === "arrow" || type === "synced_homing" || type === "green_meteor" || type === "green_meteor_shard") {
       const pos = projectilePositionAt(hazard, now);
-      return distancePoint(player, pos) <= BR_PROJECTILE_HIT_RADIUS;
+      const radius = Number(hazard.radius) || (type === "green_meteor" ? BR_GREEN_METEOR_PARENT_RADIUS : (type === "green_meteor_shard" ? BR_GREEN_METEOR_SHARD_RADIUS : BR_PROJECTILE_HIT_RADIUS));
+      const distance = distancePoint(player, pos);
+      return { hit: distance <= radius, hazardX: pos.x, hazardY: pos.y, distance, radius };
     }
-    return false;
+    return { hit: false, hazardX: 0, hazardY: 0, distance: Infinity, radius: 0 };
   }
 
   function projectilePositionAt(hazard, now) {
-    const start = hazard.start || { x: 0, y: 0 };
-    const dir = hazard.dir || { x: 1, y: 0 };
+    const start = hazard.start || { x: Number(hazard.x) || 0, y: Number(hazard.y) || 0 };
     const spawnedAt = Number(hazard.spawned_at ?? hazard.spawnedAt ?? now);
     const ageSec = Math.max(0, now - spawnedAt) / 1000;
+    const vx = finiteNumber(hazard.vx);
+    const vy = finiteNumber(hazard.vy);
+    if (vx !== null && vy !== null) {
+      return {
+        x: (Number(start.x) || 0) + vx * ageSec,
+        y: (Number(start.y) || 0) + vy * ageSec,
+      };
+    }
+    const dir = hazard.dir || { x: 1, y: 0 };
     const speed = Number(hazard.speed) || 0;
     return {
       x: (Number(start.x) || 0) + (Number(dir.x) || 0) * speed * ageSec,
       y: (Number(start.y) || 0) + (Number(dir.y) || 0) * speed * ageSec,
     };
+  }
+
+  function battleRoyaleHazardType(hazard) {
+    const type = String(hazard?.hazard_type || hazard?.type || hazard?.projectile_kind || hazard?.kind || "");
+    if (type === "projectile") return String(hazard?.projectile_kind || "arrow");
+    if (type === "laser") return String(hazard?.data?.type || "laser");
+    return type;
+  }
+
+  function battleRoyaleDamageReasonForHazard(hazard) {
+    const type = battleRoyaleHazardType(hazard);
+    if (type === "green_meteor") return "green_meteor";
+    if (type === "green_meteor_shard") return "green_meteor_shard";
+    if (type === "synced_homing") return "synced_homing";
+    if (type === "arrow") return "arrow";
+    return "laser";
+  }
+
+  function battleRoyaleDamageHazardPayload(hazard, now) {
+    const pos = projectilePositionAt(hazard, now);
+    return {
+      id: hazard.id || "",
+      type: battleRoyaleHazardType(hazard),
+      x: pos.x,
+      y: pos.y,
+      vx: Number(hazard.vx) || 0,
+      vy: Number(hazard.vy) || 0,
+      radius: Number(hazard.radius) || 0,
+      spawned_at: Number(hazard.spawned_at) || 0,
+      damage_enabled_at: Number(hazard.damage_enabled_at ?? hazard.damage_started_at) || 0,
+      expires_at: Number(hazard.expires_at) || 0,
+    };
+  }
+
+  function battleRoyaleHazardPayloads(room, now) {
+    return (Array.isArray(room.hazards) ? room.hazards : []).map((hazard) => battleRoyaleHazardPayload(room, hazard, now)).filter(Boolean);
+  }
+
+  function battleRoyaleHazardPayload(room, hazard, now) {
+    if (!hazard || !hazard.id) return null;
+    const type = battleRoyaleHazardType(hazard);
+    const pos = type === "LZ_H" || type === "LZ_V" || type === "LZ_D1" || type === "LZ_D2"
+      ? { x: Number(hazard.line_start_x ?? hazard.data?.from?.x) || 0, y: Number(hazard.line_start_y ?? hazard.data?.from?.y) || 0 }
+      : projectilePositionAt(hazard, now);
+    const start = hazard.start || { x: Number(hazard.x) || 0, y: Number(hazard.y) || 0 };
+    const payload = {
+      id: String(hazard.id || ""),
+      seq: Number(hazard.seq) || 0,
+      type,
+      hazardType: type,
+      kind: String(hazard.kind || ""),
+      projectile_kind: String(hazard.projectile_kind || ""),
+      matchId: room.matchId || "",
+      match_id: room.matchId || "",
+      roomCode: room.code,
+      spawn_x: Number(hazard.spawn_x ?? start.x ?? pos.x) || 0,
+      spawn_y: Number(hazard.spawn_y ?? start.y ?? pos.y) || 0,
+      x: pos.x,
+      y: pos.y,
+      vx: Number(hazard.vx) || 0,
+      vy: Number(hazard.vy) || 0,
+      radius: Number(hazard.radius) || (type === "green_meteor" ? BR_GREEN_METEOR_PARENT_RADIUS : (type === "green_meteor_shard" ? BR_GREEN_METEOR_SHARD_RADIUS : BR_PROJECTILE_HIT_RADIUS)),
+      warning_started_at: Number(hazard.warning_started_at) || 0,
+      spawned_at: Number(hazard.spawned_at) || 0,
+      damage_enabled_at: Number(hazard.damage_enabled_at ?? hazard.damage_started_at) || 0,
+      damage_started_at: Number(hazard.damage_enabled_at ?? hazard.damage_started_at) || 0,
+      expires_at: Number(hazard.expires_at) || 0,
+      active_at: Number(room.activeAt) || 0,
+      server_time: now,
+      target_id: String(hazard.target_id || ""),
+      turn_rate: Number(hazard.turn_rate) || 0,
+      speed: Number(hazard.speed) || 0,
+      parent_id: String(hazard.parent_id || ""),
+      parentHazardId: String(hazard.parentHazardId || hazard.parent_id || ""),
+      child_ids: Array.isArray(hazard.child_ids) ? hazard.child_ids : [],
+      burst_x: Number(hazard.burst_x) || 0,
+      burst_y: Number(hazard.burst_y) || 0,
+      burst_at: Number(hazard.burst_at) || 0,
+      angle_deg: Number(hazard.angle_deg) || 0,
+    };
+    if (hazard.data?.from && hazard.data?.to) {
+      payload.laser_line = hazard.laser_line || { start: hazard.data.from, end: hazard.data.to, width: hazard.width || BR_LASER_HIT_RADIUS * 2 };
+      payload.warning_line = hazard.warning_line || payload.laser_line;
+      payload.damage_line = hazard.damage_line || payload.laser_line;
+      payload.line_start_x = Number(hazard.line_start_x ?? hazard.data.from.x) || 0;
+      payload.line_start_y = Number(hazard.line_start_y ?? hazard.data.from.y) || 0;
+      payload.line_end_x = Number(hazard.line_end_x ?? hazard.data.to.x) || 0;
+      payload.line_end_y = Number(hazard.line_end_y ?? hazard.data.to.y) || 0;
+      payload.width = Number(hazard.width) || BR_LASER_HIT_RADIUS * 2;
+      payload.data = hazard.data;
+    }
+    return payload;
   }
 
   function requestBattleRoyaleOrbCollect(client, data = {}) {
@@ -1909,7 +2342,11 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
         const source = room.players.get(String(missile.owner_user_id || ""));
         const shieldBlocked = Boolean(hit.shield);
         const hpBefore = Number(hit.hp) || BR_INITIAL_HP;
-        applyBattleRoyaleDamage(room, hit, 1, "homing", source || null);
+        applyBattleRoyaleDamage(room, hit, 1, "br_missile", source || null, {
+          hazardId: missile.id,
+          hazardType: "br_missile",
+          serverTime: now,
+        });
         console.info(`[BR_MISSILE_HIT] match=${room.matchId || ""} room=${room.code} missile=${missile.id} target=${hit.userId} shield_block=${shieldBlocked} hp_before=${hpBefore} hp_after=${hit.hp}`);
         broadcastRoom(room, "br_event", {
           type: "missile_hit",
@@ -2459,12 +2896,17 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       finishRoom(room, currentZombieSurvivors(room));
       return;
     }
+    const brHazards = room.mode === "battle_royale" ? battleRoyaleHazardPayloads(room, now) : [];
     const payload = {
       mode: room.mode,
       server_time: now,
       match_id: room.matchId || "",
+      matchId: room.matchId || "",
+      roomCode: room.code,
+      intro_started_at: room.mode === "battle_royale" ? (room.startedAt || 0) : 0,
       round_started_at: room.mode === "zombie" || room.mode === "battle_royale" ? activeAt : 0,
       active_at: room.mode === "zombie" || room.mode === "battle_royale" ? activeAt : 0,
+      hazard_seq: room.mode === "battle_royale" ? (Number(room.hazardSeq) || 0) : 0,
       elapsed_ms: elapsed,
       tag_variant: room.mode === "tag" ? (room.tagVariant || "basic") : "",
       tag_item_select_until: room.mode === "tag" ? (room.tagItemSelectUntil || 0) : 0,
@@ -2481,7 +2923,8 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       tag_rescue_required_ms: room.mode === "tag" ? TAG_RESCUE_MS : 0,
       active_rescue: room.mode === "tag" ? activeTagRescuePayload(room) : null,
       tag_rescue: room.mode === "tag" ? (activeTagRescuePayload(room) || {}) : {},
-      multiplayer_hazards: room.mode === "battle_royale" ? (room.hazards || []) : [],
+      hazards: brHazards,
+      multiplayer_hazards: brHazards,
       safe_zone: room.mode === "battle_royale" ? battleRoyaleSafeZonePayload(room, now) : null,
       zone_radius: room.mode === "battle_royale" ? battleRoyaleZone(room, now).radius : 0,
       zone_damage_per_sec: room.mode === "battle_royale" ? battleRoyaleZone(room, now).damage : 0,
@@ -2541,6 +2984,9 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       })),
     };
     broadcastRoom(room, "positions_sync", payload);
+    if (room.mode === "battle_royale") {
+      console.info(`[BR_HAZARD_SYNC_SENT] matchId=${room.matchId || ""} roomCode=${room.code} eventName=positions_sync serverTime=${now} activeAt=${activeAt} hazardSeq=${Number(room.hazardSeq) || 0} hazardCount=${brHazards.length} hazardIds=${brHazards.map((hazard) => hazard.id).join(",")}`);
+    }
     if (room.mode === "battle_royale") {
       broadcastRoom(room, "br_state_snapshot", battleRoyaleSnapshotPayload(room, payload, now, elapsed));
     }
@@ -2835,21 +3281,27 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     const players = Array.isArray(syncPayload.players) ? syncPayload.players : [];
     const remaining = players.filter((player) => String(player.status || "") === "alive").length;
     const activeAt = Number(room.activeAt) || Number(room.startedAt) || 0;
+    const hazards = Array.isArray(syncPayload.hazards) ? syncPayload.hazards : battleRoyaleHazardPayloads(room, now);
+    console.info(`[BR_HAZARD_SYNC_SENT] matchId=${room.matchId || ""} roomCode=${room.code} eventName=br_state_snapshot serverTime=${now} activeAt=${activeAt} hazardSeq=${Number(room.hazardSeq) || 0} hazardCount=${hazards.length} hazardIds=${hazards.map((hazard) => hazard.id).join(",")}`);
     return {
       type: "snapshot",
       mode: "battle_royale",
       match_id: room.matchId || "",
+      matchId: room.matchId || "",
+      roomCode: room.code,
       server_time: now,
       round_elapsed_ms: elapsed,
+      intro_started_at: room.startedAt || 0,
       round_started_at: activeAt,
       active_at: activeAt,
+      hazard_seq: Number(room.hazardSeq) || 0,
       round_ends_at: activeAt + BR_ZONE_SHRINK_MS,
       safe_zone: syncPayload.safe_zone || battleRoyaleSafeZonePayload(room, now),
       players,
       orbs: room.brOrbs || [],
       br_orbs: room.brOrbs || [],
-      hazards: room.hazards || [],
-      multiplayer_hazards: room.hazards || [],
+      hazards,
+      multiplayer_hazards: hazards,
       missiles: room.brMissiles || [],
       br_missiles: room.brMissiles || [],
       remaining_players: remaining,
@@ -2869,6 +3321,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
   function serializeRoom(room, viewer = null) {
     const showZombieOrbs = room.mode === "zombie" && (!viewer || viewer.status !== "zombie");
     const now = Date.now();
+    const brHazards = room.mode === "battle_royale" ? battleRoyaleHazardPayloads(room, now) : [];
     return {
       code: room.code,
       room_code: room.code,
@@ -2878,8 +3331,11 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       status: room.status,
       server_time: now,
       match_id: room.matchId || "",
+      matchId: room.matchId || "",
+      roomCode: room.code,
       round_started_at: room.mode === "zombie" || room.mode === "battle_royale" ? (room.activeAt || 0) : 0,
       active_at: room.activeAt || 0,
+      hazard_seq: room.mode === "battle_royale" ? (Number(room.hazardSeq) || 0) : 0,
       round_ends_at: room.roundEndsAt || 0,
       max_players: room.maxPlayers,
       private: Boolean(room.private),
@@ -2897,7 +3353,8 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       zombie_missile_orbs: showZombieOrbs ? (room.zombieMissileOrbs || []) : [],
       zombie_missile_required: ZOMBIE_MISSILE_CHARGE_REQUIRED,
       zombie_reveal_at: room.mode === "zombie" ? (room.zombieRevealAt || ((room.startedAt || 0) + ZOMBIE_ROLE_REVEAL_MS)) : 0,
-      multiplayer_hazards: room.mode === "battle_royale" ? (room.hazards || []) : [],
+      hazards: brHazards,
+      multiplayer_hazards: brHazards,
       safe_zone: room.mode === "battle_royale" ? battleRoyaleSafeZonePayload(room, now) : null,
       players: [...room.players.values()].map((player) => ({
         user_id: player.userId,
@@ -3212,6 +3669,7 @@ function battleRoyaleSafeZonePayload(room, now = Date.now()) {
     current_radius: zone.radius,
     target_radius: BR_FINAL_ZONE_RADIUS,
     initial_radius: BR_INITIAL_ZONE_RADIUS,
+    safe_zone_ratio: battleRoyaleSafeZoneRatio(zone),
     shrink_started_at: startedAt,
     shrink_ends_at: startedAt + BR_ZONE_SHRINK_MS,
     damage_per_sec: zone.damage,
