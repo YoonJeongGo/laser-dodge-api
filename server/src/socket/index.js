@@ -212,18 +212,25 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     const defaultMax = maxPlayersForMode(mode);
     const maxPlayers = clampInt(data.max_players, 2, defaultMax, defaultMax);
     const tagVariant = mode === "tag" ? normalizeTagVariant(data.tag_variant || data.settings?.tag_variant) : "basic";
-    const room = makeRoom(mode, client, maxPlayers, false, tagVariant);
-    room.private = Boolean(data.private);
-    room.settings = cleanRoomSettings(data.settings);
-    room.settings.tag_variant = tagVariant;
-    await persistRoom(room, client.userId);
-    addPlayerToRoom(room, client, true);
-    await persistRoomPlayer(room, client.userId, true);
-    client.roomCode = room.code;
-    sendAck(ack, { ok: true, room: serializeRoom(room) });
-    client.send("room_created", { room: serializeRoom(room), room_code: room.code });
-    broadcastRoom(room, "room_updated", serializeRoom(room));
-    updateFullRoomAutoStart(room);
+    console.info(`[CREATE_ROOM_REQUEST] userId=${client.userId} mode=${mode} maxPlayers=${maxPlayers} private=${Boolean(data.private)} tagVariant=${tagVariant}`);
+    try {
+      const room = makeRoom(mode, client, maxPlayers, false, tagVariant);
+      room.private = Boolean(data.private);
+      room.settings = cleanRoomSettings(data.settings);
+      room.settings.tag_variant = tagVariant;
+      await persistRoom(room, client.userId);
+      addPlayerToRoom(room, client, true);
+      await persistRoomPlayer(room, client.userId, true);
+      client.roomCode = room.code;
+      sendAck(ack, { ok: true, room: serializeRoom(room) });
+      client.send("room_created", { room: serializeRoom(room), room_code: room.code });
+      broadcastRoom(room, "room_updated", serializeRoom(room));
+      updateFullRoomAutoStart(room);
+      console.info(`[CREATE_ROOM_CREATED] userId=${client.userId} roomCode=${room.code} mode=${mode} maxPlayers=${maxPlayers}`);
+    } catch (error) {
+      console.error(`[CREATE_ROOM_FAILED] userId=${client.userId} mode=${mode} error=${error?.message || String(error)}`);
+      sendRequestFailed(client, ack, "create_room", "room_create_failed");
+    }
   }
 
   async function joinRoom(client, data = {}, ack = null) {
@@ -247,6 +254,7 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
     leaveQuickMatch(client, false);
     const mode = normalizeMultiplayerMode(data.mode);
     const tagVariant = mode === "tag" ? normalizeTagVariant(data.tag_variant) : "basic";
+    console.info(`[QUICK_MATCH_REQUEST] userId=${client.userId} mode=${mode} tagVariant=${tagVariant}`);
     const openRoom = findOpenQuickRoom(mode, tagVariant);
     if (openRoom) {
       addPlayerToRoom(openRoom, client, false);
@@ -262,22 +270,29 @@ export function attachZombieMultiplayer({ httpServer, io, pool, verifyAuthToken,
       updateFullRoomAutoStart(openRoom);
       updateQuickRoomStart(openRoom);
       emitQuickQueue();
+      console.info(`[QUICK_MATCH_ROOM_JOINED] userId=${client.userId} roomCode=${openRoom.code} mode=${mode} players=${openRoom.players.size}/${openRoom.maxPlayers}`);
       return;
     }
 
-    const room = makeRoom(mode, client, quickMatchSizeForMode(mode), false, tagVariant);
-    room.settings.tag_variant = tagVariant;
-    room.quickMatchRoom = true;
-    await persistRoom(room, client.userId);
-    addPlayerToRoom(room, client, true);
-    await persistRoomPlayer(room, client.userId, true);
-    client.roomCode = room.code;
-    const payload = { ok: true, room: serializeRoom(room), room_code: room.code, quick_match: true };
-    client.send("room_created", payload);
-    broadcastRoom(room, "room_updated", serializeRoom(room));
-    updateFullRoomAutoStart(room);
-    updateQuickRoomStart(room);
-    emitQuickQueue();
+    try {
+      const room = makeRoom(mode, client, quickMatchSizeForMode(mode), false, tagVariant);
+      room.settings.tag_variant = tagVariant;
+      room.quickMatchRoom = true;
+      await persistRoom(room, client.userId);
+      addPlayerToRoom(room, client, true);
+      await persistRoomPlayer(room, client.userId, true);
+      client.roomCode = room.code;
+      const payload = { ok: true, room: serializeRoom(room), room_code: room.code, quick_match: true };
+      client.send("room_created", payload);
+      broadcastRoom(room, "room_updated", serializeRoom(room));
+      updateFullRoomAutoStart(room);
+      updateQuickRoomStart(room);
+      emitQuickQueue();
+      console.info(`[QUICK_MATCH_ROOM_CREATED] userId=${client.userId} roomCode=${room.code} mode=${mode} maxPlayers=${room.maxPlayers}`);
+    } catch (error) {
+      console.error(`[QUICK_MATCH_FAILED] userId=${client.userId} mode=${mode} error=${error?.message || String(error)}`);
+      sendRequestFailed(client, null, "quick_match", "room_create_failed");
+    }
   }
 
   function findOpenQuickRoom(mode, tagVariant = "basic") {
