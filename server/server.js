@@ -354,6 +354,21 @@ app.get("/", (_req, res) => {
   });
 });
 
+app.get("/version", (_req, res) => {
+  res.json({
+    ok: true,
+    version: appVersion,
+    server_version: appVersion,
+    commit: serverCommit,
+    gitCommit: serverCommit,
+    build_id: serverBuildId,
+    started_at: new Date(appStartedAt).toISOString(),
+    serverStartedAt: new Date(appStartedAt).toISOString(),
+    runtimeVersion: process.version,
+    multiplayer_protocol: multiplayerProtocol,
+  });
+});
+
 app.get("/health", async (_req, res) => {
   await pool.query("SELECT 1");
   res.json({
