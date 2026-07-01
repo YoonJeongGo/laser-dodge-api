@@ -124,7 +124,12 @@ function shouldRetryDbConnection(error) {
     "ENETUNREACH",
     "28P01",
     "3D000",
-  ].includes(code) || message.includes("getaddrinfo") || message.includes("timeout");
+  ].includes(code) ||
+    message.includes("getaddrinfo") ||
+    message.includes("timeout") ||
+    message.includes("Connection terminated unexpectedly") ||
+    message.includes("Connection terminated") ||
+    message.includes("server closed the connection");
 }
 
 async function withDbPool(operation) {
