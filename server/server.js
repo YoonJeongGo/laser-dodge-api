@@ -21,6 +21,9 @@ if (!jwtSecret) throw new Error("JWT_SECRET is required");
 const pool = new pg.Pool({
   connectionString: databaseUrl,
   ssl: process.env.DATABASE_SSL === "false" ? false : { rejectUnauthorized: false },
+  connectionTimeoutMillis: Number(process.env.DB_CONNECTION_TIMEOUT_MS || 10_000),
+  query_timeout: Number(process.env.DB_QUERY_TIMEOUT_MS || 15_000),
+  statement_timeout: Number(process.env.DB_STATEMENT_TIMEOUT_MS || 15_000),
 });
 const port = Number(process.env.PORT || 8787);
 const publicBaseUrl = process.env.PUBLIC_BASE_URL || "";
@@ -35,11 +38,17 @@ const corsOrigins = String(process.env.CORS_ORIGIN || "")
   .filter(Boolean);
 const rateLimitWindowMs = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
 const rateLimitMax = Number(process.env.RATE_LIMIT_MAX || 120);
+const schemaRetryMs = Number(process.env.SCHEMA_RETRY_MS || 30_000);
 const rateLimitBuckets = new Map();
 const loginSessions = new Map();
 const oauthStates = new Map();
 const admobSsvKeyUrl = "https://gstatic.com/admob/reward/verifier-keys.json";
 let admobSsvKeysCache = { expiresAt: 0, keys: new Map() };
+let schemaReady = false;
+let schemaInitializing = false;
+let schemaLastError = "";
+let schemaLastAttemptAt = 0;
+let schemaReadyAt = 0;
 const devRewardVerificationEnabled =
   process.env.ENABLE_DEV_AD_REWARD_VERIFY === "1" ||
   process.env.NODE_ENV === "development" ||
@@ -351,6 +360,7 @@ app.get("/", (_req, res) => {
     commit: serverCommit,
     started_at: new Date(appStartedAt).toISOString(),
     multiplayer_protocol: multiplayerProtocol,
+    schema_ready: schemaReady,
   });
 });
 
@@ -366,20 +376,42 @@ app.get("/version", (_req, res) => {
     serverStartedAt: new Date(appStartedAt).toISOString(),
     runtimeVersion: process.version,
     multiplayer_protocol: multiplayerProtocol,
+    schema_ready: schemaReady,
+    schema_last_error: schemaReady ? "" : schemaLastError,
   });
 });
 
 app.get("/health", async (_req, res) => {
+  if (!schemaReady) {
+    return res.status(503).json({
+      ok: false,
+      server: "ok",
+      db: schemaLastError ? "error" : "initializing",
+      schema_ready: false,
+      schema_initializing: schemaInitializing,
+      schema_last_error: schemaLastError,
+      schema_last_attempt_at: schemaLastAttemptAt ? new Date(schemaLastAttemptAt).toISOString() : "",
+      version: appVersion,
+      server_version: appVersion,
+      commit: serverCommit,
+      build_id: serverBuildId,
+      started_at: new Date(appStartedAt).toISOString(),
+      multiplayer_protocol: multiplayerProtocol,
+      uptime: Math.floor((Date.now() - appStartedAt) / 1000),
+    });
+  }
   await pool.query("SELECT 1");
   res.json({
     ok: true,
     server: "ok",
     db: "ok",
+    schema_ready: true,
     version: appVersion,
     server_version: appVersion,
     commit: serverCommit,
     build_id: serverBuildId,
     started_at: new Date(appStartedAt).toISOString(),
+    schema_ready_at: schemaReadyAt ? new Date(schemaReadyAt).toISOString() : "",
     multiplayer_protocol: multiplayerProtocol,
     uptime: Math.floor((Date.now() - appStartedAt) / 1000),
   });
@@ -2846,6 +2878,30 @@ async function ensureSchema() {
   await pool.query("CREATE INDEX IF NOT EXISTS zombie_results_user_idx ON zombie_results (user_id, played_at DESC)");
 }
 
+function scheduleSchemaInitialization(delayMs = 0) {
+  setTimeout(async () => {
+    if (schemaReady || schemaInitializing) return;
+    schemaInitializing = true;
+    schemaLastAttemptAt = Date.now();
+    try {
+      await ensureSchema();
+      schemaReady = true;
+      schemaReadyAt = Date.now();
+      schemaLastError = "";
+      console.log("Database schema ready");
+    } catch (error) {
+      schemaLastError = error?.message || String(error);
+      console.error("Database schema initialization failed; retrying", {
+        retryMs: schemaRetryMs,
+        error: schemaLastError,
+      });
+      scheduleSchemaInitialization(schemaRetryMs);
+    } finally {
+      schemaInitializing = false;
+    }
+  }, Math.max(0, delayMs));
+}
+
 app.use(async (error, req, res, _next) => {
   console.error(error);
   try {
@@ -2863,8 +2919,6 @@ app.use(async (error, req, res, _next) => {
   }
   res.status(error.statusCode || 500).json({ error: "server_error", request_id: req.requestId || "" });
 });
-
-await ensureSchema();
 
 attachZombieMultiplayer({
   httpServer,
@@ -2884,4 +2938,5 @@ attachZombieMultiplayer({
 
 httpServer.listen(port, "0.0.0.0", () => {
   console.log(`Laser Dodge API v2 listening on http://0.0.0.0:${port}`);
+  scheduleSchemaInitialization(0);
 });
