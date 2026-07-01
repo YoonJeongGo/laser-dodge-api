@@ -18,13 +18,30 @@ const refreshTokenSecret = process.env.REFRESH_TOKEN_SECRET || jwtSecret;
 if (!databaseUrl) throw new Error("DATABASE_URL is required");
 if (!jwtSecret) throw new Error("JWT_SECRET is required");
 
-const pool = new pg.Pool({
-  connectionString: databaseUrl,
-  ssl: process.env.DATABASE_SSL === "false" ? false : { rejectUnauthorized: false },
-  connectionTimeoutMillis: Number(process.env.DB_CONNECTION_TIMEOUT_MS || 10_000),
-  query_timeout: Number(process.env.DB_QUERY_TIMEOUT_MS || 15_000),
-  statement_timeout: Number(process.env.DB_STATEMENT_TIMEOUT_MS || 15_000),
-});
+const dbSsl = process.env.DATABASE_SSL === "false" ? false : { rejectUnauthorized: false };
+const dbConnectionTimeoutMs = Number(process.env.DB_CONNECTION_TIMEOUT_MS || 10_000);
+const dbQueryTimeoutMs = Number(process.env.DB_QUERY_TIMEOUT_MS || 15_000);
+const dbStatementTimeoutMs = Number(process.env.DB_STATEMENT_TIMEOUT_MS || 15_000);
+const dbConnectionUrls = buildDatabaseUrlCandidates(databaseUrl);
+const dbPools = dbConnectionUrls.map((connectionString) => ({
+  connectionString,
+  pool: new pg.Pool({
+    connectionString,
+    ssl: dbSsl,
+    connectionTimeoutMillis: dbConnectionTimeoutMs,
+    query_timeout: dbQueryTimeoutMs,
+    statement_timeout: dbStatementTimeoutMs,
+  }),
+}));
+let activeDbPoolIndex = 0;
+const pool = {
+  query(text, params) {
+    return withDbPool((dbPool) => dbPool.query(text, params));
+  },
+  connect() {
+    return withDbPool((dbPool) => dbPool.connect());
+  },
+};
 const port = Number(process.env.PORT || 8787);
 const publicBaseUrl = process.env.PUBLIC_BASE_URL || "";
 const appVersion = process.env.APP_VERSION || "1.0.0";
@@ -53,6 +70,81 @@ const devRewardVerificationEnabled =
   process.env.ENABLE_DEV_AD_REWARD_VERIFY === "1" ||
   process.env.NODE_ENV === "development" ||
   process.env.NODE_ENV === "test";
+
+function buildDatabaseUrlCandidates(primaryUrl) {
+  const candidates = [];
+  const addCandidate = (value) => {
+    const clean = String(value || "").trim();
+    if (clean !== "" && !candidates.includes(clean)) candidates.push(clean);
+  };
+  addCandidate(primaryUrl);
+  for (const value of String(process.env.DATABASE_URL_FALLBACKS || "").split(",")) {
+    addCandidate(value);
+  }
+  if (process.env.DATABASE_EXTERNAL_FALLBACKS !== "false") {
+    try {
+      const parsed = new URL(primaryUrl);
+      const host = parsed.hostname;
+      const looksLikeRenderInternalHost = host.startsWith("dpg-") && !host.includes(".");
+      if (looksLikeRenderInternalHost) {
+        const regions = String(process.env.DATABASE_EXTERNAL_REGIONS || "oregon,ohio,virginia,frankfurt,singapore")
+          .split(",")
+          .map((item) => item.trim())
+          .filter(Boolean);
+        for (const region of regions) {
+          const external = new URL(primaryUrl);
+          external.hostname = `${host}.${region}-postgres.render.com`;
+          addCandidate(external.toString());
+        }
+      }
+    } catch (_err) {
+      // Keep the original DATABASE_URL error path if it cannot be parsed.
+    }
+  }
+  return candidates;
+}
+
+function dbHostForLog(connectionString) {
+  try {
+    return new URL(connectionString).hostname;
+  } catch (_err) {
+    return "unparseable";
+  }
+}
+
+function shouldRetryDbConnection(error) {
+  const code = String(error?.code || "");
+  const message = String(error?.message || "");
+  return [
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    "ECONNREFUSED",
+    "ECONNRESET",
+    "ETIMEDOUT",
+    "ENETUNREACH",
+    "28P01",
+    "3D000",
+  ].includes(code) || message.includes("getaddrinfo") || message.includes("timeout");
+}
+
+async function withDbPool(operation) {
+  const failures = [];
+  for (let offset = 0; offset < dbPools.length; offset += 1) {
+    const index = (activeDbPoolIndex + offset) % dbPools.length;
+    const candidate = dbPools[index];
+    try {
+      const result = await operation(candidate.pool);
+      activeDbPoolIndex = index;
+      return result;
+    } catch (error) {
+      failures.push(`${dbHostForLog(candidate.connectionString)}: ${error.message}`);
+      if (dbPools.length <= 1 || !shouldRetryDbConnection(error)) throw error;
+    }
+  }
+  const error = new Error(`database_connection_failed: ${failures.join("; ")}`);
+  error.code = "DATABASE_CONNECTION_FAILED";
+  throw error;
+}
 
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
